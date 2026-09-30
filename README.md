@@ -109,6 +109,12 @@ and is only available in Debug builds.
 
 ## Run (macOS)
 
+The prebuilt macOS app requires Apple Silicon and macOS 14 or later.
+Download the ZIP from [GitHub Releases](https://github.com/madeye/swpasskey/releases),
+extract it, and move `swpasskeyd.app` to `/Applications` before opening it.
+The app appears as a key icon in the menu bar. Open **Preferences → Set PIN…**
+before using passkey sign-in on sites that require user verification.
+
 `IOHIDUserDevice` requires the restricted entitlement
 `com.apple.developer.hid.virtual.device`. Apple grants it per team on request;
 once granted it appears under the App ID's "Additional Capabilities" in the
