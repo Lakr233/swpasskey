@@ -884,17 +884,38 @@ NSTextField* heading(NSString* text) {
   const NSInteger sel = [self targetRow];
   if (sel < 0 || static_cast<std::size_t>(sel) >= rows_.size()) return;
   const swpk::ui::KeyRow row = rows_[static_cast<std::size_t>(sel)];
+  // Deleting cannot be undone and may lock the user out of the account, so
+  // they type the account name (the website for U2F rows, which have none)
+  // before Delete turns on.
+  const bool by_account = !row.u2f && account_text(row).length > 0;
+  NSString* expected = by_account ? account_text(row) : ns(row.rp_id);
   NSAlert* alert = [[NSAlert alloc] init];
   alert.alertStyle = NSAlertStyleWarning;
-  alert.messageText = [NSString stringWithFormat:@"Delete the passkey for %@?", ns(row.rp_id)];
+  alert.messageText = @"Delete This Passkey?";
   alert.informativeText = [NSString stringWithFormat:
-      @"You won’t be able to sign in to %@ as %@ with this passkey. This can’t be undone.",
-      ns(row.rp_id), row.u2f ? @"this account" : account_text(row)];
+      @"You won’t be able to sign in to %@ with it. This can’t be undone.\n\nTo confirm, type %@:",
+      ns(row.rp_id), by_account ? @"the account name" : @"the website"];
   NSButton* del = [alert addButtonWithTitle:@"Delete"];
   del.hasDestructiveAction = YES;
-  [alert addButtonWithTitle:@"Cancel"];
+  del.enabled = NO;
+  [alert addButtonWithTitle:@"Cancel"].keyEquivalent = @"\033";
+  NSTextField* field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 260, 24)];
+  field.placeholderString = expected;
+  field.accessibilityLabel = by_account ? @"Account name" : @"Website";
+  alert.accessoryView = field;
+  alert.window.initialFirstResponder = field;
+  id observer = [[NSNotificationCenter defaultCenter]
+      addObserverForName:NSControlTextDidChangeNotification
+                  object:field
+                   queue:nil
+              usingBlock:^(NSNotification*) {
+                NSString* typed = [field.stringValue
+                    stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                del.enabled = [typed isEqualToString:expected];
+              }];
   [alert beginSheetModalForWindow:keysWindow_ completionHandler:^(NSModalResponse response) {
-    if (response != NSAlertFirstButtonReturn) return;
+    [[NSNotificationCenter defaultCenter] removeObserver:observer];
+    if (response != NSAlertFirstButtonReturn || !del.enabled) return;
     [self deleteCredential:row];
   }];
 }
