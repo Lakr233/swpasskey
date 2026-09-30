@@ -87,9 +87,12 @@ Decision StdinPresence::confirm(const PresenceRequest& req, ctap::CancelToken& c
     }
     return Decision::Timeout;
   }
+  // Client-controlled text: strip control characters so escape sequences
+  // cannot rewrite the prompt line.
+  const std::string rp = detail::clamp_text(req.rp_id);
+  const std::string user = detail::clamp_text(req.user_display);
   std::fprintf(stderr, "\n[swpasskey] %s for rp=\"%s\"%s%s — approve? [y/N] ",
-               kind_name(req.kind), req.rp_id.c_str(),
-               req.user_display.empty() ? "" : " user=", req.user_display.c_str());
+               kind_name(req.kind), rp.c_str(), user.empty() ? "" : " user=", user.c_str());
   std::fflush(stderr);
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   for (;;) {

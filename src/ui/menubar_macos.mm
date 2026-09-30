@@ -3,6 +3,12 @@
 // and the Preferences window (launch at login via SMAppService, log level,
 // daemon facts), and quits the daemon.
 //
+// Dock: the app is an accessory (no Dock icon) until its status menu is open
+// or one of its windows is on screen; then it becomes a regular app so the
+// windows show up in the Dock and Cmd-Tab. It drops back when both are gone.
+// A short welcome window at launch says where the app lives, unless it was
+// started by its own login item or the user turned the welcome off.
+//
 // Everything here runs on the main thread inside the AppKit loop that
 // AlertPresence::run_main_loop() drives. Store reads go through
 // CredentialStore's own mutex; deletes go through Authenticator::ctl_delete
@@ -18,13 +24,29 @@
 #import <Foundation/Foundation.h>
 #import <ServiceManagement/ServiceManagement.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace {
 
 constexpr const char* kLogLevelDefault = "SWPKLogLevel";
+constexpr const char* kHideWelcomeDefault = "SWPKHideWelcome";
+constexpr const char* kAgentLabel = "com.tangzixiang.swpasskey.daemon";
 NSString* const kAgentPlist = @"com.tangzixiang.swpasskey.daemon.plist";
+
+// launchd sets XPC_SERVICE_NAME to the job label for the login item.
+bool launched_by_login_item() {
+  const char* name = std::getenv("XPC_SERVICE_NAME");
+  return name != nullptr && std::strcmp(name, kAgentLabel) == 0;
+}
+
+NSMenuItem* menu_item(NSString* title, SEL action, NSString* key, id target = nil) {
+  NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:key];
+  item.target = target;
+  return item;
+}
 
 NSString* ns(const std::string& s) {
   NSString* out = [NSString stringWithUTF8String:s.c_str()];
@@ -93,7 +115,8 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
 
 }  // namespace
 
-@interface SWPKMenuController : NSObject <NSMenuDelegate, NSTableViewDataSource, NSTableViewDelegate>
+@interface SWPKMenuController
+    : NSObject <NSApplicationDelegate, NSMenuDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate>
 - (instancetype)initWithDeps:(swpk::ui::MenuBarDeps)deps;
 - (void)teardown;
 @end
@@ -114,7 +137,10 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   NSPopUpButton* levelPopup_;
   NSButton* pinButton_;
   NSTextField* pinStatus_;
+  NSWindow* welcomeWindow_;
+  NSButton* welcomeHide_;
   BOOL pinBusy_;
+  BOOL menuOpen_;
   BOOL tornDown_;
 }
 
@@ -157,6 +183,16 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   [menu_ addItem:quit];
   item_.menu = menu_;
   [self refreshSummary];
+  [self installMainMenu];
+  NSApp.delegate = self;
+  // Queued until the presence loop runs NSApp (it sets the accessory policy
+  // first), so the welcome's Dock switch is not overwritten.
+  if (!launched_by_login_item() &&
+      ![[NSUserDefaults standardUserDefaults] boolForKey:@(kHideWelcomeDefault)]) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (!tornDown_) [self showWelcome];
+    });
+  }
   swpk::log::info("menubar_ready");
   return self;
 }
@@ -167,14 +203,147 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
     [[NSStatusBar systemStatusBar] removeStatusItem:item_];
     item_ = nil;
   }
+  if (NSApp.delegate == self) {
+    NSApp.delegate = nil;
+  }
+  [welcomeWindow_ close];
   [keysWindow_ close];
   [prefsWindow_ close];
+}
+
+// Only visible while the app is regular (a window is open): Quit, the edit
+// commands the PIN fields need, and Close / Minimize for the windows.
+- (void)installMainMenu {
+  NSMenu* bar = [[NSMenu alloc] init];
+  NSMenu* app = [[NSMenu alloc] initWithTitle:@"swpasskey"];
+  [app addItem:menu_item(@"Preferences…", @selector(showPreferences:), @",", self)];
+  [app addItem:[NSMenuItem separatorItem]];
+  [app addItem:menu_item(@"Quit swpasskey", @selector(quit:), @"q", self)];
+  NSMenu* edit = [[NSMenu alloc] initWithTitle:@"Edit"];
+  [edit addItem:menu_item(@"Cut", @selector(cut:), @"x")];
+  [edit addItem:menu_item(@"Copy", @selector(copy:), @"c")];
+  [edit addItem:menu_item(@"Paste", @selector(paste:), @"v")];
+  [edit addItem:menu_item(@"Select All", @selector(selectAll:), @"a")];
+  NSMenu* window = [[NSMenu alloc] initWithTitle:@"Window"];
+  [window addItem:menu_item(@"Close", @selector(performClose:), @"w")];
+  [window addItem:menu_item(@"Minimize", @selector(performMiniaturize:), @"m")];
+  [window addItem:[NSMenuItem separatorItem]];
+  [window addItem:menu_item(@"Keys", @selector(showKeys:), @"k", self)];
+  for (NSMenu* sub in @[ app, edit, window ]) {
+    NSMenuItem* holder = [[NSMenuItem alloc] initWithTitle:sub.title action:nil keyEquivalent:@""];
+    holder.submenu = sub;
+    [bar addItem:holder];
+  }
+  NSApp.mainMenu = bar;
+  NSApp.windowsMenu = window;
+}
+
+#pragma mark - Dock
+
+- (void)updateDockPolicy {
+  if (tornDown_) return;
+  const BOOL visible = menuOpen_ || welcomeWindow_.visible || keysWindow_.visible || prefsWindow_.visible ||
+                       keysWindow_.miniaturized || prefsWindow_.miniaturized;
+  const NSApplicationActivationPolicy want =
+      visible ? NSApplicationActivationPolicyRegular : NSApplicationActivationPolicyAccessory;
+  if (NSApp.activationPolicy != want) {
+    [NSApp setActivationPolicy:want];
+  }
+}
+
+// Deferred one turn: the window being closed is still visible here, and a
+// menu action (Keys…, Preferences…) runs after menuDidClose:.
+- (void)scheduleDockUpdate {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self updateDockPolicy];
+  });
+}
+
+- (void)present:(NSWindow*)window {
+  [window makeKeyAndOrderFront:nil];
+  [self updateDockPolicy];
+  activate_app();
+}
+
+- (void)windowWillClose:(NSNotification*)notification {
+  [self scheduleDockUpdate];
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
+  // Dock › Quit or logout: stop the daemon loop, which stops NSApp and lets
+  // main() shut down cleanly. Later (not Cancel) so logout is not vetoed;
+  // the process exits before a reply is needed.
+  [self quit:sender];
+  return NSTerminateLater;
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication*)sender hasVisibleWindows:(BOOL)flag {
+  if (!flag) [self showKeys:sender];
+  return NO;
+}
+
+#pragma mark - welcome
+
+- (void)showWelcome {
+  if (welcomeWindow_ == nil) {
+    [self buildWelcomeWindow];
+  }
+  [self present:welcomeWindow_];
+}
+
+- (void)buildWelcomeWindow {
+  const CGFloat W = 420, H = 150;
+  welcomeWindow_ = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, W, H)
+                                               styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                                                 backing:NSBackingStoreBuffered
+                                                   defer:NO];
+  welcomeWindow_.title = @"swpasskey";
+  welcomeWindow_.releasedWhenClosed = NO;
+  welcomeWindow_.delegate = self;
+  [welcomeWindow_ center];
+  NSView* v = welcomeWindow_.contentView;
+
+  NSImageView* icon = [NSImageView imageViewWithImage:[NSApp applicationIconImage]];
+  icon.frame = NSMakeRect(20, H - 84, 64, 64);
+  [v addSubview:icon];
+  NSTextField* title = label(@"swpasskey is running", NSMakeRect(100, H - 44, W - 120, 22), true);
+  [v addSubview:title];
+  NSTextField* body = [NSTextField wrappingLabelWithString:
+      @"Find it in the menu bar under the key icon. Browsers can now use it as a security key."];
+  body.frame = NSMakeRect(100, H - 90, W - 120, 40);
+  body.textColor = [NSColor secondaryLabelColor];
+  [v addSubview:body];
+
+  welcomeHide_ = [NSButton checkboxWithTitle:@"Don’t show this again" target:nil action:nil];
+  welcomeHide_.frame = NSMakeRect(100, 18, 200, 20);
+  [v addSubview:welcomeHide_];
+  NSButton* ok = [NSButton buttonWithTitle:@"OK" target:self action:@selector(dismissWelcome:)];
+  ok.frame = NSMakeRect(W - 100, 12, 80, 32);
+  ok.keyEquivalent = @"\r";
+  [v addSubview:ok];
+}
+
+- (void)dismissWelcome:(id)sender {
+  if (welcomeHide_.state == NSControlStateValueOn) {
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@(kHideWelcomeDefault)];
+  }
+  [welcomeWindow_ close];
 }
 
 #pragma mark - menu
 
 - (void)menuNeedsUpdate:(NSMenu*)menu {
   [self refreshSummary];
+}
+
+- (void)menuWillOpen:(NSMenu*)menu {
+  menuOpen_ = YES;
+  [self updateDockPolicy];
+}
+
+- (void)menuDidClose:(NSMenu*)menu {
+  menuOpen_ = NO;
+  [self scheduleDockUpdate];
 }
 
 - (void)refreshSummary {
@@ -196,8 +365,7 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
     [self buildKeysWindow];
   }
   [self reloadKeys];
-  activate_app();
-  [keysWindow_ makeKeyAndOrderFront:nil];
+  [self present:keysWindow_];
 }
 
 - (void)buildKeysWindow {
@@ -210,6 +378,7 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   keysWindow_.title = @"swpasskey Keys";
   keysWindow_.releasedWhenClosed = NO;
   keysWindow_.minSize = NSMakeSize(520, 240);
+  keysWindow_.delegate = self;
   [keysWindow_ center];
   NSView* content = keysWindow_.contentView;
 
@@ -340,8 +509,7 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   }
   [self refreshLoginState];
   [self refreshPinState];
-  activate_app();
-  [prefsWindow_ makeKeyAndOrderFront:nil];
+  [self present:prefsWindow_];
 }
 
 - (void)buildPreferencesWindow {
@@ -352,6 +520,7 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
                                                  defer:NO];
   prefsWindow_.title = @"swpasskey Preferences";
   prefsWindow_.releasedWhenClosed = NO;
+  prefsWindow_.delegate = self;
   [prefsWindow_ center];
   NSView* v = prefsWindow_.contentView;
   CGFloat y = H - 44;

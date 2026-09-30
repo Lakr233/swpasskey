@@ -107,8 +107,12 @@ Decision AlertPresence::confirm(const PresenceRequest& req, ctap::CancelToken& c
         alert.messageText = title;
         alert.informativeText = body;
         alert.alertStyle = NSAlertStyleInformational;
-        [alert addButtonWithTitle:@"Approve"];
+        // Deny is the default (Return) and Approve has no key equivalent: the
+        // alert steals focus, so a keystroke already in flight must not
+        // approve a request the user never saw.
         [alert addButtonWithTitle:@"Deny"];
+        NSButton* approve = [alert addButtonWithTitle:@"Approve"];
+        approve.keyEquivalent = @"";
         [NSApp activateIgnoringOtherApps:YES];
         resp = [alert runModal];
         [alert.window orderOut:nil];
@@ -119,7 +123,7 @@ Decision AlertPresence::confirm(const PresenceRequest& req, ctap::CancelToken& c
       modal_running_ = false;
       if (run_it && !decided_) {
         decided_ = true;
-        decision_ = resp == NSAlertFirstButtonReturn ? Decision::Allow : Decision::Deny;
+        decision_ = resp == NSAlertSecondButtonReturn ? Decision::Allow : Decision::Deny;
       }
       finished_ = true;
     }
