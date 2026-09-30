@@ -197,7 +197,13 @@ PanelText panel_text(swpk::ui::PresenceRequest::Kind kind, NSString* site, NSStr
                                             self->action_.enabled = YES;
                                           }];
   [[NSRunLoop currentRunLoop] addTimer:arm forMode:NSRunLoopCommonModes];
+  // macOS 27 may refuse to activate an accessory app on demand ("ordered
+  // front from a non-active application and may order beneath"). Put the
+  // panel on screen above everything first, then ask for activation so it
+  // also takes keyboard focus when the system allows it.
+  [panel_ orderFrontRegardless];
   [NSApp activateIgnoringOtherApps:YES];
+  [panel_ makeKeyWindow];
   const NSModalResponse r = [NSApp runModalForWindow:panel_];
   [arm invalidate];
   [panel_ orderOut:nil];

@@ -41,6 +41,7 @@ NSToolbarItemIdentifier const kSearchItem = @"swpk.search";
 NSToolbarItemIdentifier const kDeleteItem = @"swpk.delete";
 
 constexpr CGFloat kSettingsWidth = 500;
+constexpr NSTimeInterval kDockHideDelay = 2.0;  // see -updateDockPolicy
 
 // launchd sets XPC_SERVICE_NAME to the job label for the login item.
 bool launched_by_login_item() {
@@ -304,6 +305,9 @@ NSTextField* heading(NSString* text) {
 
 - (void)teardown {
   tornDown_ = YES;
+  [NSObject cancelPreviousPerformRequestsWithTarget:self];
+  [keysTimer_ invalidate];
+  keysTimer_ = nil;
   if (item_ != nil) {
     [[NSStatusBar systemStatusBar] removeStatusItem:item_];
     item_ = nil;
@@ -355,25 +359,46 @@ NSTextField* heading(NSString* text) {
   return visible;
 }
 
+// Showing the Dock icon is immediate (a window cannot take focus without
+// it). Hiding is debounced by kDockHideDelay: every policy change makes the
+// menu bar re-lay out, so closing and reopening windows, or glancing at the
+// status menu, must not flip it back and forth.
 - (void)updateDockPolicy {
   if (tornDown_) return;
-  const NSApplicationActivationPolicy want =
-      [self wantsDockIcon] ? NSApplicationActivationPolicyRegular : NSApplicationActivationPolicyAccessory;
-  if (NSApp.activationPolicy == want) return;
-  if (want == NSApplicationActivationPolicyAccessory && NSApp.active) {
-    // Dropping to accessory while frontmost pulls our menus out from under
-    // the menu bar and makes it re-lay out (status items jump, worst with a
-    // notch). Hand the menu bar back to the previous app first, then switch
-    // once we are in the background.
-    [NSApp hide:nil];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-      if (!tornDown_ && ![self wantsDockIcon]) {
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-      }
-    });
+  [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideDockIconNow) object:nil];
+  if ([self wantsDockIcon]) {
+    if (NSApp.activationPolicy != NSApplicationActivationPolicyRegular) {
+      [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    }
     return;
   }
-  [NSApp setActivationPolicy:want];
+  if (NSApp.activationPolicy == NSApplicationActivationPolicyAccessory) return;
+  [self performSelector:@selector(hideDockIconNow)
+             withObject:nil
+             afterDelay:kDockHideDelay
+                inModes:@[ NSRunLoopCommonModes ]];
+}
+
+- (void)hideDockIconNow {
+  if (tornDown_ || [self wantsDockIcon]) return;
+  if (NSApp.modalWindow != nil) {
+    // An approval prompt is up: hiding the app would hide the prompt too.
+    [self updateDockPolicy];
+    return;
+  }
+  if (!NSApp.active) {
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    return;
+  }
+  // Dropping to accessory while frontmost pulls our menus out from under
+  // the menu bar in place. Hand the menu bar back to the previous app first,
+  // then switch once we are in the background.
+  [NSApp hide:nil];
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    if (!tornDown_ && ![self wantsDockIcon] && NSApp.modalWindow == nil) {
+      [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    }
+  });
 }
 
 // Deferred one turn: the window being closed is still visible here, and a
