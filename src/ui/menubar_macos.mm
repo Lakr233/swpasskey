@@ -1,7 +1,7 @@
 // macOS menu bar status item for swpasskeyd: a key icon whose menu shows the
-// credential count, opens the Keys window (installed credentials, delete)
-// and the Preferences window (launch at login via SMAppService, log level,
-// daemon facts), and quits the daemon.
+// passkey count and opens the Passkeys window (toolbar with search and delete
+// over a table of saved passkeys) and the Settings window (General, Security
+// and About tabs), and quits the daemon.
 //
 // Dock: the app is an accessory (no Dock icon) until its status menu is open
 // or one of its windows is on screen; then it becomes a regular app so the
@@ -24,6 +24,7 @@
 #import <Foundation/Foundation.h>
 #import <ServiceManagement/ServiceManagement.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -36,16 +37,16 @@ constexpr const char* kHideWelcomeDefault = "SWPKHideWelcome";
 constexpr const char* kAgentLabel = "com.tangzixiang.swpasskey.daemon";
 NSString* const kAgentPlist = @"com.tangzixiang.swpasskey.daemon.plist";
 
+NSToolbarItemIdentifier const kSearchItem = @"swpk.search";
+NSToolbarItemIdentifier const kDeleteItem = @"swpk.delete";
+NSToolbarItemIdentifier const kRefreshItem = @"swpk.refresh";
+
+constexpr CGFloat kSettingsWidth = 500;
+
 // launchd sets XPC_SERVICE_NAME to the job label for the login item.
 bool launched_by_login_item() {
   const char* name = std::getenv("XPC_SERVICE_NAME");
   return name != nullptr && std::strcmp(name, kAgentLabel) == 0;
-}
-
-NSMenuItem* menu_item(NSString* title, SEL action, NSString* key, id target = nil) {
-  NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:key];
-  item.target = target;
-  return item;
 }
 
 NSString* ns(const std::string& s) {
@@ -70,23 +71,18 @@ std::vector<std::uint8_t> unhex(const std::string& h) {
   return out;
 }
 
-const char* level_name(swpk::log::Level l) {
-  switch (l) {
-    case swpk::log::Level::Error: return "error";
-    case swpk::log::Level::Warn: return "warn";
-    case swpk::log::Level::Info: return "info";
-    case swpk::log::Level::Debug: return "debug";
-  }
-  return "info";
-}
+struct LevelChoice {
+  swpk::log::Level level;
+  const char* key;    // stored in defaults
+  NSString* title;    // shown in Settings
+};
 
-bool level_from_name(const std::string& n, swpk::log::Level& out) {
-  if (n == "error") { out = swpk::log::Level::Error; return true; }
-  if (n == "warn") { out = swpk::log::Level::Warn; return true; }
-  if (n == "info") { out = swpk::log::Level::Info; return true; }
-  if (n == "debug") { out = swpk::log::Level::Debug; return true; }
-  return false;
-}
+const LevelChoice kLevels[] = {
+    {swpk::log::Level::Error, "error", @"Errors only"},
+    {swpk::log::Level::Warn, "warn", @"Warnings and errors"},
+    {swpk::log::Level::Info, "info", @"Standard"},
+    {swpk::log::Level::Debug, "debug", @"Detailed (for troubleshooting)"},
+};
 
 void activate_app() {
   if (@available(macOS 14.0, *)) {
@@ -99,46 +95,153 @@ void activate_app() {
   }
 }
 
-NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
-  NSTextField* f = [[NSTextField alloc] initWithFrame:frame];
-  f.stringValue = text;
-  f.editable = NO;
-  f.bordered = NO;
-  f.drawsBackground = NO;
-  f.selectable = YES;
+NSTextField* label(NSString* text) {
+  NSTextField* f = [NSTextField labelWithString:text];
   f.lineBreakMode = NSLineBreakByTruncatingMiddle;
-  if (bold) {
-    f.font = [NSFont boldSystemFontOfSize:[NSFont systemFontSize]];
+  return f;
+}
+
+NSTextField* note(NSString* text) {
+  NSTextField* f = [NSTextField wrappingLabelWithString:text];
+  f.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
+  f.textColor = [NSColor secondaryLabelColor];
+  f.selectable = NO;
+  return f;
+}
+
+NSMenuItem* menu_item(NSString* title, SEL action, NSString* key, id target = nil) {
+  NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:key];
+  item.target = target;
+  return item;
+}
+
+NSDate* date_of(std::uint64_t unix_seconds) {
+  return [NSDate dateWithTimeIntervalSince1970:static_cast<double>(unix_seconds)];
+}
+
+// "Created": the day only; the time adds noise to a list.
+NSString* format_day(std::uint64_t unix_seconds) {
+  if (unix_seconds == 0) return @"—";
+  static NSDateFormatter* f = [] {
+    NSDateFormatter* d = [[NSDateFormatter alloc] init];
+    d.dateStyle = NSDateFormatterMediumStyle;
+    d.timeStyle = NSDateFormatterNoStyle;
+    return d;
+  }();
+  return [f stringFromDate:date_of(unix_seconds)];
+}
+
+// "Last Used": relative ("2 hours ago"), which is what the column is for.
+NSString* format_recent(std::uint64_t unix_seconds) {
+  if (unix_seconds == 0) return @"Never";
+  static NSRelativeDateTimeFormatter* f = [] {
+    NSRelativeDateTimeFormatter* r = [[NSRelativeDateTimeFormatter alloc] init];
+    r.unitsStyle = NSRelativeDateTimeFormatterUnitsStyleFull;
+    return r;
+  }();
+  return [f localizedStringForDate:date_of(unix_seconds) relativeToDate:[NSDate date]];
+}
+
+NSString* format_full(std::uint64_t unix_seconds) {
+  if (unix_seconds == 0) return nil;
+  return [NSDateFormatter localizedStringFromDate:date_of(unix_seconds)
+                                        dateStyle:NSDateFormatterLongStyle
+                                        timeStyle:NSDateFormatterShortStyle];
+}
+
+// The domain is what the passkey is bound to; the RP's display name is only a
+// hint and goes in the tooltip.
+NSString* site_text(const swpk::ui::KeyRow& r) { return ns(r.rp_id); }
+
+NSString* account_text(const swpk::ui::KeyRow& r) {
+  if (r.u2f) return @"Security key sign-in (U2F)";
+  return ns(r.user_name.empty() ? r.user_display : r.user_name);
+}
+
+// A settings pane: a vertical stack with fixed width, pinned to the top.
+NSViewController* pane(NSString* title, NSString* symbol, NSArray<NSView*>* rows) {
+  NSStackView* stack = [NSStackView stackViewWithViews:rows];
+  stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+  stack.alignment = NSLayoutAttributeLeading;
+  stack.spacing = 8;
+  stack.edgeInsets = NSEdgeInsetsMake(20, 28, 24, 28);
+  stack.translatesAutoresizingMaskIntoConstraints = NO;
+  NSView* v = [[NSView alloc] init];
+  [v addSubview:stack];
+  [NSLayoutConstraint activateConstraints:@[
+    [stack.leadingAnchor constraintEqualToAnchor:v.leadingAnchor],
+    [stack.trailingAnchor constraintEqualToAnchor:v.trailingAnchor],
+    [stack.topAnchor constraintEqualToAnchor:v.topAnchor],
+    [stack.bottomAnchor constraintEqualToAnchor:v.bottomAnchor],
+    [v.widthAnchor constraintEqualToConstant:kSettingsWidth],
+  ]];
+  // Full-width text, separators and grids, unless the caller already sized
+  // the row (an indented note).
+  for (NSView* row in rows) {
+    BOOL sized = NO;
+    for (NSLayoutConstraint* c in row.constraints) {
+      if (c.firstItem == row && c.firstAttribute == NSLayoutAttributeWidth) sized = YES;
+    }
+    if (!sized && ([row isKindOfClass:[NSTextField class]] || [row isKindOfClass:[NSBox class]] ||
+                   [row isKindOfClass:[NSGridView class]])) {
+      [row.widthAnchor constraintEqualToConstant:kSettingsWidth - 56].active = YES;
+    }
   }
+  NSViewController* vc = [[NSViewController alloc] init];
+  vc.view = v;
+  vc.title = title;
+  vc.preferredContentSize = v.fittingSize;
+  vc.representedObject = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:title];
+  return vc;
+}
+
+NSBox* separator() {
+  NSBox* b = [[NSBox alloc] init];
+  b.boxType = NSBoxSeparator;
+  return b;
+}
+
+NSTextField* heading(NSString* text) {
+  NSTextField* f = label(text);
+  f.font = [NSFont systemFontOfSize:[NSFont systemFontSize] weight:NSFontWeightSemibold];
   return f;
 }
 
 }  // namespace
 
 @interface SWPKMenuController
-    : NSObject <NSApplicationDelegate, NSMenuDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate>
+    : NSObject <NSApplicationDelegate, NSMenuDelegate, NSSearchFieldDelegate, NSTableViewDataSource,
+                NSTableViewDelegate, NSToolbarDelegate, NSWindowDelegate>
 - (instancetype)initWithDeps:(swpk::ui::MenuBarDeps)deps;
 - (void)teardown;
 @end
 
 @implementation SWPKMenuController {
   swpk::ui::MenuBarDeps deps_;
-  std::vector<swpk::ui::KeyRow> rows_;
+  std::vector<swpk::ui::KeyRow> allRows_;
+  std::vector<swpk::ui::KeyRow> rows_;  // allRows_ filtered by the search field
   NSStatusItem* item_;
   NSMenu* menu_;
   NSMenuItem* summaryItem_;
+
   NSWindow* keysWindow_;
   NSTableView* table_;
-  NSButton* deleteButton_;
-  NSTextField* keysStatus_;
-  NSWindow* prefsWindow_;
+  NSView* emptyState_;
+  NSTextField* emptyTitle_;
+  NSToolbarItem* deleteItem_;
+  NSSearchField* search_;
+
+  NSWindow* settingsWindow_;
   NSButton* loginCheckbox_;
   NSTextField* loginNote_;
+  NSButton* welcomeCheckbox_;
   NSPopUpButton* levelPopup_;
   NSButton* pinButton_;
   NSTextField* pinStatus_;
+
   NSWindow* welcomeWindow_;
   NSButton* welcomeHide_;
+
   BOOL pinBusy_;
   BOOL menuOpen_;
   BOOL tornDown_;
@@ -158,29 +261,18 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   } else {
     item_.button.title = @"\U0001F511";
   }
-  item_.button.toolTip = @"swpasskey software authenticator";
+  item_.button.toolTip = @"swpasskey";
 
   menu_ = [[NSMenu alloc] initWithTitle:@"swpasskey"];
   menu_.delegate = self;
-  NSMenuItem* title = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"swpasskey %@", ns(deps_.version)]
-                                                 action:nil
-                                          keyEquivalent:@""];
-  title.enabled = NO;
-  [menu_ addItem:title];
   summaryItem_ = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
   summaryItem_.enabled = NO;
   [menu_ addItem:summaryItem_];
   [menu_ addItem:[NSMenuItem separatorItem]];
-  NSMenuItem* keys = [[NSMenuItem alloc] initWithTitle:@"Keys…" action:@selector(showKeys:) keyEquivalent:@"k"];
-  keys.target = self;
-  [menu_ addItem:keys];
-  NSMenuItem* prefs = [[NSMenuItem alloc] initWithTitle:@"Preferences…" action:@selector(showPreferences:) keyEquivalent:@","];
-  prefs.target = self;
-  [menu_ addItem:prefs];
+  [menu_ addItem:menu_item(@"Passkeys…", @selector(showKeys:), @"k", self)];
+  [menu_ addItem:menu_item(@"Settings…", @selector(showSettings:), @",", self)];
   [menu_ addItem:[NSMenuItem separatorItem]];
-  NSMenuItem* quit = [[NSMenuItem alloc] initWithTitle:@"Quit swpasskey" action:@selector(quit:) keyEquivalent:@"q"];
-  quit.target = self;
-  [menu_ addItem:quit];
+  [menu_ addItem:menu_item(@"Quit swpasskey", @selector(quit:), @"q", self)];
   item_.menu = menu_;
   [self refreshSummary];
   [self installMainMenu];
@@ -208,15 +300,15 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   }
   [welcomeWindow_ close];
   [keysWindow_ close];
-  [prefsWindow_ close];
+  [settingsWindow_ close];
 }
 
-// Only visible while the app is regular (a window is open): Quit, the edit
-// commands the PIN fields need, and Close / Minimize for the windows.
+// Only visible while the app is regular (a window is open): Settings, Quit,
+// the edit commands the PIN fields need, and Close / Minimize for windows.
 - (void)installMainMenu {
   NSMenu* bar = [[NSMenu alloc] init];
   NSMenu* app = [[NSMenu alloc] initWithTitle:@"swpasskey"];
-  [app addItem:menu_item(@"Preferences…", @selector(showPreferences:), @",", self)];
+  [app addItem:menu_item(@"Settings…", @selector(showSettings:), @",", self)];
   [app addItem:[NSMenuItem separatorItem]];
   [app addItem:menu_item(@"Quit swpasskey", @selector(quit:), @"q", self)];
   NSMenu* edit = [[NSMenu alloc] initWithTitle:@"Edit"];
@@ -224,11 +316,13 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   [edit addItem:menu_item(@"Copy", @selector(copy:), @"c")];
   [edit addItem:menu_item(@"Paste", @selector(paste:), @"v")];
   [edit addItem:menu_item(@"Select All", @selector(selectAll:), @"a")];
+  [edit addItem:[NSMenuItem separatorItem]];
+  [edit addItem:menu_item(@"Find", @selector(focusSearch:), @"f", self)];
   NSMenu* window = [[NSMenu alloc] initWithTitle:@"Window"];
   [window addItem:menu_item(@"Close", @selector(performClose:), @"w")];
   [window addItem:menu_item(@"Minimize", @selector(performMiniaturize:), @"m")];
   [window addItem:[NSMenuItem separatorItem]];
-  [window addItem:menu_item(@"Keys", @selector(showKeys:), @"k", self)];
+  [window addItem:menu_item(@"Passkeys", @selector(showKeys:), @"k", self)];
   for (NSMenu* sub in @[ app, edit, window ]) {
     NSMenuItem* holder = [[NSMenuItem alloc] initWithTitle:sub.title action:nil keyEquivalent:@""];
     holder.submenu = sub;
@@ -242,8 +336,10 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
 
 - (void)updateDockPolicy {
   if (tornDown_) return;
-  const BOOL visible = menuOpen_ || welcomeWindow_.visible || keysWindow_.visible || prefsWindow_.visible ||
-                       keysWindow_.miniaturized || prefsWindow_.miniaturized;
+  BOOL visible = menuOpen_;
+  for (NSWindow* w : {welcomeWindow_, keysWindow_, settingsWindow_}) {
+    if (w != nil && (w.visible || w.miniaturized)) visible = YES;
+  }
   const NSApplicationActivationPolicy want =
       visible ? NSApplicationActivationPolicyRegular : NSApplicationActivationPolicyAccessory;
   if (NSApp.activationPolicy != want) {
@@ -252,7 +348,7 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
 }
 
 // Deferred one turn: the window being closed is still visible here, and a
-// menu action (Keys…, Preferences…) runs after menuDidClose:.
+// menu action (Passkeys…, Settings…) runs after menuDidClose:.
 - (void)scheduleDockUpdate {
   dispatch_async(dispatch_get_main_queue(), ^{
     [self updateDockPolicy];
@@ -267,6 +363,11 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
 
 - (void)windowWillClose:(NSNotification*)notification {
   [self scheduleDockUpdate];
+}
+
+- (void)windowDidBecomeKey:(NSNotification*)notification {
+  if (notification.object == keysWindow_) [self reloadKeys];
+  if (notification.object == settingsWindow_) [self refreshSettings];
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
@@ -292,35 +393,59 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
 }
 
 - (void)buildWelcomeWindow {
-  const CGFloat W = 420, H = 150;
-  welcomeWindow_ = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, W, H)
-                                               styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+  const CGFloat W = 400;
+  welcomeWindow_ = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, W, 200)
+                                               styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                                          NSWindowStyleMaskFullSizeContentView)
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
-  welcomeWindow_.title = @"swpasskey";
+  welcomeWindow_.titlebarAppearsTransparent = YES;
+  welcomeWindow_.titleVisibility = NSWindowTitleHidden;
+  welcomeWindow_.movableByWindowBackground = YES;
   welcomeWindow_.releasedWhenClosed = NO;
   welcomeWindow_.delegate = self;
-  [welcomeWindow_ center];
-  NSView* v = welcomeWindow_.contentView;
 
   NSImageView* icon = [NSImageView imageViewWithImage:[NSApp applicationIconImage]];
-  icon.frame = NSMakeRect(20, H - 84, 64, 64);
-  [v addSubview:icon];
-  NSTextField* title = label(@"swpasskey is running", NSMakeRect(100, H - 44, W - 120, 22), true);
-  [v addSubview:title];
+  [icon.widthAnchor constraintEqualToConstant:64].active = YES;
+  [icon.heightAnchor constraintEqualToConstant:64].active = YES;
+  NSTextField* title = label(@"swpasskey is ready");
+  title.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
   NSTextField* body = [NSTextField wrappingLabelWithString:
-      @"Find it in the menu bar under the key icon. Browsers can now use it as a security key."];
-  body.frame = NSMakeRect(100, H - 90, W - 120, 40);
+      @"Websites can now use swpasskey as a security key. It runs in the menu bar: click the key icon "
+      @"to see your passkeys or open Settings."];
+  body.alignment = NSTextAlignmentCenter;
   body.textColor = [NSColor secondaryLabelColor];
-  [v addSubview:body];
+  body.selectable = NO;
 
   welcomeHide_ = [NSButton checkboxWithTitle:@"Don’t show this again" target:nil action:nil];
-  welcomeHide_.frame = NSMakeRect(100, 18, 200, 20);
-  [v addSubview:welcomeHide_];
   NSButton* ok = [NSButton buttonWithTitle:@"OK" target:self action:@selector(dismissWelcome:)];
-  ok.frame = NSMakeRect(W - 100, 12, 80, 32);
   ok.keyEquivalent = @"\r";
-  [v addSubview:ok];
+  ok.controlSize = NSControlSizeLarge;
+  [ok.widthAnchor constraintGreaterThanOrEqualToConstant:90].active = YES;
+  NSStackView* footer = [NSStackView stackViewWithViews:@[ welcomeHide_, ok ]];
+  footer.distribution = NSStackViewDistributionEqualSpacing;
+
+  NSStackView* stack = [NSStackView stackViewWithViews:@[ icon, title, body, footer ]];
+  stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+  stack.alignment = NSLayoutAttributeCenterX;
+  stack.spacing = 8;
+  [stack setCustomSpacing:14 afterView:icon];
+  [stack setCustomSpacing:22 afterView:body];
+  stack.edgeInsets = NSEdgeInsetsMake(32, 28, 20, 28);
+  stack.translatesAutoresizingMaskIntoConstraints = NO;
+  NSView* content = welcomeWindow_.contentView;
+  [content addSubview:stack];
+  [NSLayoutConstraint activateConstraints:@[
+    [stack.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+    [stack.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+    [stack.topAnchor constraintEqualToAnchor:content.topAnchor],
+    [stack.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
+    [content.widthAnchor constraintEqualToConstant:W],
+    [body.widthAnchor constraintEqualToConstant:W - 56],
+    [footer.widthAnchor constraintEqualToConstant:W - 56],
+  ]];
+  [welcomeWindow_ layoutIfNeeded];
+  [welcomeWindow_ center];
 }
 
 - (void)dismissWelcome:(id)sender {
@@ -358,7 +483,7 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   }
 }
 
-#pragma mark - keys window
+#pragma mark - Passkeys window
 
 - (void)showKeys:(id)sender {
   if (keysWindow_ == nil) {
@@ -368,113 +493,293 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   [self present:keysWindow_];
 }
 
+- (void)focusSearch:(id)sender {
+  if (keysWindow_.visible) [keysWindow_ makeFirstResponder:search_];
+}
+
 - (void)buildKeysWindow {
-  NSRect frame = NSMakeRect(0, 0, 720, 380);
+  const NSRect frame = NSMakeRect(0, 0, 760, 420);
   keysWindow_ = [[NSWindow alloc] initWithContentRect:frame
                                             styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                                                       NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+                                                       NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable |
+                                                       NSWindowStyleMaskFullSizeContentView)
                                               backing:NSBackingStoreBuffered
                                                 defer:NO];
-  keysWindow_.title = @"swpasskey Keys";
+  keysWindow_.title = @"Passkeys";
+  keysWindow_.subtitle = @"";
   keysWindow_.releasedWhenClosed = NO;
-  keysWindow_.minSize = NSMakeSize(520, 240);
+  keysWindow_.minSize = NSMakeSize(560, 260);
   keysWindow_.delegate = self;
-  [keysWindow_ center];
-  NSView* content = keysWindow_.contentView;
+  keysWindow_.toolbarStyle = NSWindowToolbarStyleUnified;
+  keysWindow_.frameAutosaveName = @"SWPKPasskeysWindow";
 
-  NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(16, 52, frame.size.width - 32, frame.size.height - 68)];
+  NSToolbar* toolbar = [[NSToolbar alloc] initWithIdentifier:@"SWPKPasskeysToolbar"];
+  toolbar.delegate = self;
+  toolbar.displayMode = NSToolbarDisplayModeIconOnly;
+  keysWindow_.toolbar = toolbar;
+
+  NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:frame];
   scroll.hasVerticalScroller = YES;
-  scroll.borderType = NSBezelBorder;
+  scroll.autohidesScrollers = YES;
+  scroll.borderType = NSNoBorder;
   scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
   table_ = [[NSTableView alloc] initWithFrame:scroll.bounds];
+  table_.style = NSTableViewStyleInset;
   table_.dataSource = self;
   table_.delegate = self;
   table_.allowsMultipleSelection = NO;
   table_.usesAlternatingRowBackgroundColors = YES;
   table_.columnAutoresizingStyle = NSTableViewUniformColumnAutoresizingStyle;
-  struct Col { NSString* id; NSString* title; CGFloat width; };
+  table_.target = self;
+  struct Col {
+    NSString* id;
+    NSString* title;
+    CGFloat width;
+    NSString* sort;
+  };
   const Col cols[] = {
-      {@"rp", @"Site", 180}, {@"user", @"User", 150}, {@"backend", @"Key storage", 110},
-      {@"created", @"Created", 110}, {@"used", @"Last used", 110}, {@"count", @"Uses", 50},
+      {@"site", @"Website", 190, @"site"}, {@"account", @"Account", 200, @"account"},
+      {@"used", @"Last Used", 110, @"used"}, {@"created", @"Created", 120, @"created"},
+      {@"count", @"Sign-ins", 64, @"count"},
   };
   for (const auto& c : cols) {
     NSTableColumn* col = [[NSTableColumn alloc] initWithIdentifier:c.id];
     col.title = c.title;
     col.width = c.width;
-    col.minWidth = 40;
+    col.minWidth = 50;
+    if (c.sort != nil) {
+      col.sortDescriptorPrototype = [NSSortDescriptor sortDescriptorWithKey:c.sort ascending:YES];
+    }
+    if ([c.id isEqualToString:@"count"]) {
+      col.headerCell.alignment = NSTextAlignmentRight;
+    }
     [table_ addTableColumn:col];
   }
+  NSMenu* context = [[NSMenu alloc] init];
+  [context addItem:menu_item(@"Copy Website", @selector(copySite:), @"", self)];
+  [context addItem:[NSMenuItem separatorItem]];
+  [context addItem:menu_item(@"Delete Passkey…", @selector(deleteSelected:), @"", self)];
+  table_.menu = context;
   scroll.documentView = table_;
+
+  NSView* content = keysWindow_.contentView;
+  scroll.frame = content.bounds;
   [content addSubview:scroll];
+  [table_ sizeToFit];
 
-  keysStatus_ = label(@"", NSMakeRect(16, 18, frame.size.width - 260, 20));
-  keysStatus_.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-  keysStatus_.textColor = [NSColor secondaryLabelColor];
-  [content addSubview:keysStatus_];
+  emptyTitle_ = label(@"No Passkeys");
+  emptyTitle_.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
+  emptyTitle_.textColor = [NSColor secondaryLabelColor];
+  NSTextField* emptyBody = note(@"When you create a passkey on a website with swpasskey, it appears here.");
+  emptyBody.alignment = NSTextAlignmentCenter;
+  NSStackView* empty = [NSStackView stackViewWithViews:@[ emptyTitle_, emptyBody ]];
+  empty.orientation = NSUserInterfaceLayoutOrientationVertical;
+  empty.spacing = 6;
+  empty.translatesAutoresizingMaskIntoConstraints = NO;
+  [content addSubview:empty];
+  [NSLayoutConstraint activateConstraints:@[
+    [empty.centerXAnchor constraintEqualToAnchor:content.centerXAnchor],
+    [empty.centerYAnchor constraintEqualToAnchor:content.centerYAnchor constant:20],
+    [emptyBody.widthAnchor constraintLessThanOrEqualToConstant:320],
+  ]];
+  emptyState_ = empty;
+  [keysWindow_ center];
+}
 
-  NSButton* refresh = [NSButton buttonWithTitle:@"Refresh" target:self action:@selector(reloadKeys)];
-  refresh.frame = NSMakeRect(frame.size.width - 226, 12, 100, 32);
-  refresh.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-  [content addSubview:refresh];
+- (NSArray<NSToolbarItemIdentifier>*)toolbarDefaultItemIdentifiers:(NSToolbar*)toolbar {
+  return @[ kRefreshItem, NSToolbarFlexibleSpaceItemIdentifier, kDeleteItem, kSearchItem ];
+}
 
-  deleteButton_ = [NSButton buttonWithTitle:@"Delete…" target:self action:@selector(deleteSelected:)];
-  deleteButton_.frame = NSMakeRect(frame.size.width - 116, 12, 100, 32);
-  deleteButton_.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-  deleteButton_.enabled = NO;
-  [content addSubview:deleteButton_];
+- (NSArray<NSToolbarItemIdentifier>*)toolbarAllowedItemIdentifiers:(NSToolbar*)toolbar {
+  return [self toolbarDefaultItemIdentifiers:toolbar];
+}
+
+- (NSToolbarItem*)toolbar:(NSToolbar*)toolbar
+        itemForItemIdentifier:(NSToolbarItemIdentifier)identifier
+    willBeInsertedIntoToolbar:(BOOL)flag {
+  if ([identifier isEqualToString:kSearchItem]) {
+    NSSearchToolbarItem* item = [[NSSearchToolbarItem alloc] initWithItemIdentifier:identifier];
+    search_ = item.searchField;
+    search_.placeholderString = @"Search websites and accounts";
+    search_.delegate = self;
+    search_.target = self;
+    search_.action = @selector(searchChanged:);
+    return item;
+  }
+  NSToolbarItem* item = [[NSToolbarItem alloc] initWithItemIdentifier:identifier];
+  item.target = self;
+  item.bordered = YES;
+  if ([identifier isEqualToString:kDeleteItem]) {
+    item.label = @"Delete";
+    item.toolTip = @"Delete the selected passkey";
+    item.image = [NSImage imageWithSystemSymbolName:@"trash" accessibilityDescription:@"Delete"];
+    item.action = @selector(deleteSelected:);
+    item.autovalidates = NO;
+    item.enabled = NO;
+    deleteItem_ = item;
+  } else if ([identifier isEqualToString:kRefreshItem]) {
+    item.label = @"Refresh";
+    item.toolTip = @"Reload the passkey list";
+    item.image = [NSImage imageWithSystemSymbolName:@"arrow.clockwise" accessibilityDescription:@"Refresh"];
+    item.action = @selector(reloadKeys);
+  }
+  return item;
+}
+
+- (void)searchChanged:(id)sender {
+  [self applyFilter];
+}
+
+- (void)controlTextDidChange:(NSNotification*)notification {
+  if (notification.object == search_) [self applyFilter];
 }
 
 - (void)reloadKeys {
-  rows_ = deps_.store != nullptr ? swpk::ui::key_rows(*deps_.store) : std::vector<swpk::ui::KeyRow>{};
-  [table_ reloadData];
-  keysStatus_.stringValue = ns(swpk::ui::keys_summary(rows_.size(), deps_.key_backend));
-  deleteButton_.enabled = table_.selectedRow >= 0;
+  allRows_ = deps_.store != nullptr ? swpk::ui::key_rows(*deps_.store) : std::vector<swpk::ui::KeyRow>{};
+  [self applyFilter];
   [self refreshSummary];
+}
+
+- (void)applyFilter {
+  NSString* q = search_ != nil ? search_.stringValue : @"";
+  q = [q stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+  rows_.clear();
+  for (const auto& r : allRows_) {
+    if (q.length == 0 || [site_text(r) localizedCaseInsensitiveContainsString:q] ||
+        [account_text(r) localizedCaseInsensitiveContainsString:q]) {
+      rows_.push_back(r);
+    }
+  }
+  [self sortRows];
+  [table_ reloadData];
+  const bool none = allRows_.empty();
+  emptyTitle_.stringValue = none ? @"No Passkeys" : @"No Results";
+  emptyState_.hidden = !rows_.empty();
+  table_.enclosingScrollView.hidden = rows_.empty();
+  if (none) {
+    keysWindow_.subtitle = @"";
+  } else {
+    keysWindow_.subtitle = ns(swpk::ui::keys_summary(allRows_.size(), deps_.key_backend));
+  }
+  [self updateDeleteItem];
+}
+
+- (void)sortRows {
+  NSSortDescriptor* d = table_.sortDescriptors.firstObject;
+  if (d == nil) return;
+  NSString* key = d.key;
+  const bool asc = d.ascending;
+  auto cmp = [&](const swpk::ui::KeyRow& a, const swpk::ui::KeyRow& b) -> bool {
+    NSComparisonResult r = NSOrderedSame;
+    if ([key isEqualToString:@"site"]) {
+      r = [site_text(a) localizedStandardCompare:site_text(b)];
+    } else if ([key isEqualToString:@"account"]) {
+      r = [account_text(a) localizedStandardCompare:account_text(b)];
+    } else if ([key isEqualToString:@"used"]) {
+      r = a.last_used_unix < b.last_used_unix ? NSOrderedAscending
+          : a.last_used_unix > b.last_used_unix ? NSOrderedDescending : NSOrderedSame;
+    } else if ([key isEqualToString:@"created"]) {
+      r = a.created_unix < b.created_unix ? NSOrderedAscending
+          : a.created_unix > b.created_unix ? NSOrderedDescending : NSOrderedSame;
+    } else if ([key isEqualToString:@"count"]) {
+      r = a.sign_count < b.sign_count ? NSOrderedAscending
+          : a.sign_count > b.sign_count ? NSOrderedDescending : NSOrderedSame;
+    }
+    return asc ? r == NSOrderedAscending : r == NSOrderedDescending;
+  };
+  std::stable_sort(rows_.begin(), rows_.end(), cmp);
+}
+
+- (void)tableView:(NSTableView*)tableView sortDescriptorsDidChange:(NSArray<NSSortDescriptor*>*)oldDescriptors {
+  [self sortRows];
+  [table_ reloadData];
+  [self updateDeleteItem];
 }
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView*)tableView {
   return static_cast<NSInteger>(rows_.size());
 }
 
-- (id)tableView:(NSTableView*)tableView objectValueForTableColumn:(NSTableColumn*)column row:(NSInteger)row {
-  if (row < 0 || static_cast<std::size_t>(row) >= rows_.size()) return @"";
+- (NSView*)tableView:(NSTableView*)tableView viewForTableColumn:(NSTableColumn*)column row:(NSInteger)row {
+  if (row < 0 || static_cast<std::size_t>(row) >= rows_.size()) return nil;
   const auto& r = rows_[static_cast<std::size_t>(row)];
   NSString* ident = column.identifier;
-  if ([ident isEqualToString:@"rp"]) {
-    return r.rp_name.empty() || r.rp_name == r.rp_id ? ns(r.rp_id) : [NSString stringWithFormat:@"%@ (%@)", ns(r.rp_id), ns(r.rp_name)];
+  NSTextField* cell = [tableView makeViewWithIdentifier:ident owner:self];
+  if (cell == nil) {
+    cell = label(@"");
+    cell.identifier = ident;
+    cell.lineBreakMode = NSLineBreakByTruncatingTail;
   }
-  if ([ident isEqualToString:@"user"]) {
-    if (r.u2f) return @"(U2F registration)";
-    if (!r.user_display.empty() && r.user_display != r.user_name) {
-      return [NSString stringWithFormat:@"%@ (%@)", ns(r.user_name), ns(r.user_display)];
-    }
-    return ns(r.user_name);
+  cell.textColor = [NSColor labelColor];
+  cell.alignment = NSTextAlignmentNatural;
+  cell.toolTip = nil;
+  if ([ident isEqualToString:@"site"]) {
+    cell.stringValue = site_text(r);
+    cell.toolTip = r.rp_name.empty() || r.rp_name == r.rp_id
+                       ? [NSString stringWithFormat:@"Stored in %@", ns(r.backend)]
+                       : [NSString stringWithFormat:@"%@ · stored in %@", ns(r.rp_name), ns(r.backend)];
+  } else if ([ident isEqualToString:@"account"]) {
+    cell.stringValue = account_text(r);
+    if (!r.u2f && !r.user_display.empty() && r.user_display != r.user_name) cell.toolTip = ns(r.user_display);
+    if (r.u2f) cell.textColor = [NSColor secondaryLabelColor];
+  } else if ([ident isEqualToString:@"used"]) {
+    cell.stringValue = format_recent(r.last_used_unix);
+    cell.toolTip = format_full(r.last_used_unix);
+    if (r.last_used_unix == 0) cell.textColor = [NSColor secondaryLabelColor];
+  } else if ([ident isEqualToString:@"created"]) {
+    cell.stringValue = format_day(r.created_unix);
+    cell.toolTip = format_full(r.created_unix);
+  } else if ([ident isEqualToString:@"count"]) {
+    cell.stringValue = [NSString stringWithFormat:@"%u", r.sign_count];
+    cell.alignment = NSTextAlignmentRight;
   }
-  if ([ident isEqualToString:@"backend"]) return ns(r.backend);
-  if ([ident isEqualToString:@"created"]) return ns(swpk::ui::format_unix_time(r.created_unix));
-  if ([ident isEqualToString:@"used"]) {
-    const auto s = swpk::ui::format_unix_time(r.last_used_unix);
-    return s.empty() ? @"never" : ns(s);
-  }
-  if ([ident isEqualToString:@"count"]) return [NSString stringWithFormat:@"%u", r.sign_count];
-  return @"";
+  return cell;
 }
 
 - (void)tableViewSelectionDidChange:(NSNotification*)notification {
-  deleteButton_.enabled = table_.selectedRow >= 0;
+  [self updateDeleteItem];
+}
+
+- (void)updateDeleteItem {
+  deleteItem_.enabled = table_.selectedRow >= 0;
+}
+
+// Context menu acts on the clicked row; otherwise on the selection.
+- (NSInteger)targetRow {
+  return table_.clickedRow >= 0 ? table_.clickedRow : table_.selectedRow;
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem*)item {
+  if (item.action == @selector(deleteSelected:) || item.action == @selector(copySite:)) {
+    return [self targetRow] >= 0;
+  }
+  if (item.action == @selector(focusSearch:)) {
+    return keysWindow_.keyWindow;
+  }
+  return YES;
+}
+
+- (void)copySite:(id)sender {
+  const NSInteger sel = [self targetRow];
+  if (sel < 0 || static_cast<std::size_t>(sel) >= rows_.size()) return;
+  [NSPasteboard.generalPasteboard clearContents];
+  [NSPasteboard.generalPasteboard setString:ns(rows_[static_cast<std::size_t>(sel)].rp_id)
+                                    forType:NSPasteboardTypeString];
 }
 
 - (void)deleteSelected:(id)sender {
-  const NSInteger sel = table_.selectedRow;
+  const NSInteger sel = [self targetRow];
   if (sel < 0 || static_cast<std::size_t>(sel) >= rows_.size()) return;
   const swpk::ui::KeyRow row = rows_[static_cast<std::size_t>(sel)];
   NSAlert* alert = [[NSAlert alloc] init];
   alert.alertStyle = NSAlertStyleWarning;
   alert.messageText = [NSString stringWithFormat:@"Delete the passkey for %@?", ns(row.rp_id)];
   alert.informativeText = [NSString stringWithFormat:
-      @"User: %@\nThe site will no longer accept this key. This cannot be undone.",
-      row.u2f ? @"U2F registration" : ns(row.user_name)];
-  [alert addButtonWithTitle:@"Delete"];
+      @"You won’t be able to sign in to %@ as %@ with this passkey. This can’t be undone.",
+      ns(row.rp_id), row.u2f ? @"this account" : account_text(row)];
+  NSButton* del = [alert addButtonWithTitle:@"Delete"];
+  del.hasDestructiveAction = YES;
   [alert addButtonWithTitle:@"Cancel"];
   [alert beginSheetModalForWindow:keysWindow_ completionHandler:^(NSModalResponse response) {
     if (response != NSAlertFirstButtonReturn) return;
@@ -491,8 +796,10 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   if (!r) {
     NSAlert* err = [[NSAlert alloc] init];
     err.alertStyle = NSAlertStyleCritical;
-    err.messageText = @"Could not delete the key";
-    err.informativeText = [NSString stringWithFormat:@"CTAP status 0x%02x", static_cast<unsigned>(r.error())];
+    err.messageText = @"Couldn’t delete the passkey";
+    err.informativeText = [NSString stringWithFormat:
+        @"Try again. If it keeps failing, check the log in ~/Library/Logs/swpasskey. (Error 0x%02x)",
+        static_cast<unsigned>(r.error())];
     [err beginSheetModalForWindow:keysWindow_ completionHandler:nil];
     swpk::log::warn("menubar_delete_failed", {{"cred_id", row.cred_id_hex.substr(0, 16)}});
   } else {
@@ -501,118 +808,184 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   [self reloadKeys];
 }
 
-#pragma mark - preferences window
+#pragma mark - Settings window
 
-- (void)showPreferences:(id)sender {
-  if (prefsWindow_ == nil) {
-    [self buildPreferencesWindow];
+- (void)showSettings:(id)sender {
+  if (settingsWindow_ == nil) {
+    [self buildSettingsWindow];
   }
-  [self refreshLoginState];
-  [self refreshPinState];
-  [self present:prefsWindow_];
+  [self refreshSettings];
+  [self present:settingsWindow_];
 }
 
-- (void)buildPreferencesWindow {
-  const CGFloat W = 480, H = 420;
-  prefsWindow_ = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, W, H)
-                                             styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
-                                               backing:NSBackingStoreBuffered
-                                                 defer:NO];
-  prefsWindow_.title = @"swpasskey Preferences";
-  prefsWindow_.releasedWhenClosed = NO;
-  prefsWindow_.delegate = self;
-  [prefsWindow_ center];
-  NSView* v = prefsWindow_.contentView;
-  CGFloat y = H - 44;
+- (void)refreshSettings {
+  [self refreshLoginState];
+  [self refreshPinState];
+  welcomeCheckbox_.state = [[NSUserDefaults standardUserDefaults] boolForKey:@(kHideWelcomeDefault)]
+                               ? NSControlStateValueOff
+                               : NSControlStateValueOn;
+}
 
-  loginCheckbox_ = [NSButton checkboxWithTitle:@"Launch swpasskey at login" target:self action:@selector(toggleLogin:)];
-  loginCheckbox_.frame = NSMakeRect(20, y, W - 40, 20);
-  [v addSubview:loginCheckbox_];
-  y -= 20;
-  loginNote_ = label(@"", NSMakeRect(38, y, W - 58, 18));
-  loginNote_.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
-  loginNote_.textColor = [NSColor secondaryLabelColor];
-  [v addSubview:loginNote_];
-  y -= 36;
+- (void)buildSettingsWindow {
+  NSTabViewController* tabs = [[NSTabViewController alloc] init];
+  tabs.tabStyle = NSTabViewControllerTabStyleToolbar;
+  for (NSViewController* vc in @[ [self generalPane], [self securityPane], [self aboutPane] ]) {
+    NSTabViewItem* item = [NSTabViewItem tabViewItemWithViewController:vc];
+    item.label = vc.title;
+    item.image = vc.representedObject;
+    [tabs addTabViewItem:item];
+  }
+  settingsWindow_ = [NSWindow windowWithContentViewController:tabs];
+  settingsWindow_.styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable;
+  settingsWindow_.toolbarStyle = NSWindowToolbarStylePreference;
+  settingsWindow_.releasedWhenClosed = NO;
+  settingsWindow_.delegate = self;
+  [settingsWindow_ center];
+}
 
-  [v addSubview:label(@"Log level:", NSMakeRect(20, y + 2, 90, 20))];
-  levelPopup_ = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(110, y - 2, 140, 26) pullsDown:NO];
-  [levelPopup_ addItemsWithTitles:@[ @"error", @"warn", @"info", @"debug" ]];
-  [levelPopup_ selectItemWithTitle:@(level_name(swpk::log::level()))];
+- (NSViewController*)generalPane {
+  loginCheckbox_ = [NSButton checkboxWithTitle:@"Open swpasskey at login" target:self action:@selector(toggleLogin:)];
+  loginNote_ = note(@"");
+  // Indented under the checkbox title (checkbox glyph + gap is about 20 pt).
+  [loginNote_.widthAnchor constraintEqualToConstant:kSettingsWidth - 56 - 20].active = YES;
+  welcomeCheckbox_ = [NSButton checkboxWithTitle:@"Show the welcome window when swpasskey opens"
+                                          target:self
+                                          action:@selector(toggleWelcome:)];
+
+  levelPopup_ = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+  for (const auto& l : kLevels) {
+    [levelPopup_ addItemWithTitle:l.title];
+    levelPopup_.lastItem.representedObject = @(l.key);
+    if (l.level == swpk::log::level()) [levelPopup_ selectItem:levelPopup_.lastItem];
+  }
   levelPopup_.target = self;
   levelPopup_.action = @selector(changeLogLevel:);
-  [v addSubview:levelPopup_];
-  y -= 22;
-  NSTextField* levelNote = label(@"Applies now and at the next launch (JSON lines on stderr).", NSMakeRect(20, y, W - 40, 18));
-  levelNote.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
-  levelNote.textColor = [NSColor secondaryLabelColor];
-  [v addSubview:levelNote];
-  y -= 34;
+  NSStackView* levelRow = [NSStackView stackViewWithViews:@[ label(@"Log detail:"), levelPopup_ ]];
+  levelRow.spacing = 8;
+  NSTextField* levelNote = note(@"Saved to ~/Library/Logs/swpasskey. Use Detailed only while troubleshooting.");
 
-  [v addSubview:label(@"Security key PIN", NSMakeRect(20, y, 240, 20), true)];
+  NSViewController* vc = pane(@"General", @"gearshape", @[
+    loginCheckbox_, loginNote_, welcomeCheckbox_, separator(), levelRow, levelNote,
+  ]);
+  NSStackView* stack = vc.view.subviews.firstObject;
+  [stack setCustomSpacing:2 afterView:loginCheckbox_];
+  [stack setCustomSpacing:14 afterView:loginNote_];
+  [stack setCustomSpacing:14 afterView:welcomeCheckbox_];
+  [loginNote_.leadingAnchor constraintEqualToAnchor:stack.leadingAnchor constant:28 + 20].active = YES;
+  return vc;
+}
+
+- (NSViewController*)securityPane {
+  pinStatus_ = label(@"");
   pinButton_ = [NSButton buttonWithTitle:@"Set PIN…" target:self action:@selector(setPin:)];
-  pinButton_.frame = NSMakeRect(W - 150, y - 5, 130, 30);
-  [v addSubview:pinButton_];
-  y -= 26;
-  pinStatus_ = label(@"", NSMakeRect(20, y, W - 40, 20));
-  [v addSubview:pinStatus_];
-  y -= 24;
-  NSTextField* pinNote = label(@"Used by sites that require PIN verification to sign in.",
-                              NSMakeRect(20, y, W - 40, 20));
-  pinNote.textColor = [NSColor secondaryLabelColor];
-  [v addSubview:pinNote];
-  y -= 40;
+  NSStackView* pinRow = [NSStackView stackViewWithViews:@[ pinStatus_, pinButton_ ]];
+  pinRow.distribution = NSStackViewDistributionEqualSpacing;
+  [pinRow.widthAnchor constraintEqualToConstant:kSettingsWidth - 56].active = YES;
+  NSTextField* pinNote = note(
+      @"Some websites ask for a PIN before they accept a passkey. You’ll enter this PIN in the browser. "
+      @"Changing it keeps your saved passkeys.");
+  NSTextField* presenceNote = note(
+      @"swpasskey asks you before a website can create or use a passkey. Requests you don’t answer "
+      @"are declined after 30 seconds.");
+  return pane(@"Security", @"lock", @[
+    heading(@"Security Key PIN"), pinRow, pinNote, separator(), heading(@"Approvals"), presenceNote,
+  ]);
+}
 
-  NSBox* sep = [[NSBox alloc] initWithFrame:NSMakeRect(20, y, W - 40, 1)];
-  sep.boxType = NSBoxSeparator;
-  [v addSubview:sep];
-  y -= 28;
+- (NSViewController*)aboutPane {
+  NSImageView* icon = [NSImageView imageViewWithImage:[NSApp applicationIconImage]];
+  [icon.widthAnchor constraintEqualToConstant:48].active = YES;
+  [icon.heightAnchor constraintEqualToConstant:48].active = YES;
+  NSTextField* name = label(@"swpasskey");
+  name.font = [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold];
+  NSTextField* version = note([NSString stringWithFormat:@"Version %@", ns(deps_.version)]);
+  NSStackView* titles = [NSStackView stackViewWithViews:@[ name, version ]];
+  titles.orientation = NSUserInterfaceLayoutOrientationVertical;
+  titles.alignment = NSLayoutAttributeLeading;
+  titles.spacing = 2;
+  NSStackView* header = [NSStackView stackViewWithViews:@[ icon, titles ]];
+  header.spacing = 12;
 
-  struct Fact { NSString* k; std::string v; };
-  const Fact facts[] = {
-      {@"Version", deps_.version},
-      {@"Key storage", deps_.key_backend},
-      {@"Serial", deps_.serial},
-      {@"Store", deps_.store_path},
-      {@"Control socket", deps_.ctl_socket},
+  auto key = [](NSString* s) {
+    NSTextField* f = label(s);
+    [f setContentCompressionResistancePriority:NSLayoutPriorityRequired
+                                forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return f;
   };
-  for (const auto& f : facts) {
-    NSTextField* k = label(f.k, NSMakeRect(20, y, 110, 18), true);
-    k.alignment = NSTextAlignmentRight;
-    [v addSubview:k];
-    [v addSubview:label(ns(f.v), NSMakeRect(140, y, W - 160, 18))];
-    y -= 24;
+  auto value = [](const std::string& s) {
+    NSTextField* f = label(ns(s));
+    f.selectable = YES;
+    f.toolTip = ns(s);
+    [f setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return f;
+  };
+  NSButton* reveal = [NSButton buttonWithTitle:@"Show in Finder" target:self action:@selector(revealStore:)];
+  reveal.controlSize = NSControlSizeSmall;
+  reveal.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
+  NSGridView* grid = [NSGridView gridViewWithViews:@[
+    @[ key(@"Key storage:"), value(deps_.key_backend) ],
+    @[ key(@"Serial number:"), value(deps_.serial) ],
+    @[ key(@"Passkey file:"), value(deps_.store_path) ],
+    @[ NSGridCell.emptyContentView, reveal ],
+    @[ key(@"Control socket:"), value(deps_.ctl_socket) ],
+  ]];
+  grid.rowSpacing = 6;
+  grid.columnSpacing = 8;
+  [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
+  [grid rowAtIndex:3].topPadding = -2;
+  for (NSInteger i = 0; i < grid.numberOfRows; ++i) {
+    [grid rowAtIndex:i].yPlacement = NSGridCellPlacementCenter;
   }
+  NSTextField* disclaimer = note(
+      @"swpasskey is a software security key. Secure Enclave and TPM keys can’t be copied off this Mac, "
+      @"but any app running as you can ask to use them, so each request needs your approval.");
+  return pane(@"About", @"info.circle", @[ header, separator(), grid, separator(), disclaimer ]);
+}
+
+- (void)revealStore:(id)sender {
+  NSURL* url = [NSURL fileURLWithPath:ns(deps_.store_path)];
+  [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ url ]];
+}
+
+- (void)toggleWelcome:(id)sender {
+  [[NSUserDefaults standardUserDefaults] setBool:welcomeCheckbox_.state != NSControlStateValueOn
+                                          forKey:@(kHideWelcomeDefault)];
 }
 
 - (void)refreshPinState {
   if (pinBusy_) return;
   const bool configured = deps_.store != nullptr && deps_.store->pin().hash.has_value();
-  pinStatus_.stringValue = configured ? @"PIN is configured." : @"No PIN set. Set one before signing in with a passkey.";
-  pinButton_.title = configured ? @"Set new PIN…" : @"Set PIN…";
+  pinStatus_.stringValue = configured ? @"A PIN is set." : @"No PIN is set.";
+  pinButton_.title = configured ? @"Change PIN…" : @"Set PIN…";
   pinButton_.enabled = static_cast<bool>(deps_.control_request);
 }
 
 - (void)setPin:(id)sender {
   if (pinBusy_ || !deps_.control_request) return;
+  const bool configured = deps_.store != nullptr && deps_.store->pin().hash.has_value();
   NSAlert* alert = [[NSAlert alloc] init];
-  alert.messageText = @"Set your security key PIN";
-  alert.informativeText = @"Choose at least 4 characters (up to 63 UTF-8 bytes). You’ll use this PIN when signing in. Existing passkeys are kept.";
-  [alert addButtonWithTitle:@"Set PIN"];
+  alert.messageText = configured ? @"Change the security key PIN" : @"Set a security key PIN";
+  alert.informativeText = @"Use at least 4 characters. Websites that ask for a PIN will use this one.";
+  NSButton* save = [alert addButtonWithTitle:configured ? @"Change PIN" : @"Set PIN"];
   [alert addButtonWithTitle:@"Cancel"];
-  NSView* form = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 340, 110)];
-  [form addSubview:label(@"New PIN", NSMakeRect(0, 86, 340, 20))];
-  NSSecureTextField* pin = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 60, 340, 24)];
+  NSSecureTextField* pin = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 0, 260, 22)];
+  pin.placeholderString = @"New PIN";
   pin.accessibilityLabel = @"New PIN";
-  [form addSubview:pin];
-  [form addSubview:label(@"Repeat PIN", NSMakeRect(0, 30, 340, 20))];
-  NSSecureTextField* repeat = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 4, 340, 24)];
-  repeat.accessibilityLabel = @"Repeat PIN";
-  [form addSubview:repeat];
+  NSSecureTextField* repeat = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 0, 260, 22)];
+  repeat.placeholderString = @"Confirm PIN";
+  repeat.accessibilityLabel = @"Confirm PIN";
+  NSStackView* form = [NSStackView stackViewWithViews:@[ pin, repeat ]];
+  form.orientation = NSUserInterfaceLayoutOrientationVertical;
+  form.spacing = 8;
+  form.frame = NSMakeRect(0, 0, 260, 52);
+  [pin.widthAnchor constraintEqualToConstant:260].active = YES;
+  [repeat.widthAnchor constraintEqualToConstant:260].active = YES;
   pin.nextKeyView = repeat;
+  repeat.nextKeyView = save;
   alert.accessoryView = form;
   alert.window.initialFirstResponder = pin;
-  [alert beginSheetModalForWindow:prefsWindow_ completionHandler:^(NSModalResponse response) {
+  [alert beginSheetModalForWindow:settingsWindow_ completionHandler:^(NSModalResponse response) {
     NSString* value = pin.stringValue;
     const BOOL matches = [value isEqualToString:repeat.stringValue];
     pin.stringValue = @"";
@@ -622,7 +995,8 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
     const NSUInteger characters = [value lengthOfBytesUsingEncoding:NSUTF32LittleEndianStringEncoding] / 4;
     if (!matches || characters < 4 || bytes > 63 ||
         [value rangeOfString:[NSString stringWithFormat:@"%C", (unichar)0]].location != NSNotFound) {
-      pinStatus_.stringValue = !matches ? @"PINs did not match. Try again." : @"Use at least 4 characters and at most 63 UTF-8 bytes.";
+      pinStatus_.stringValue = !matches ? @"The PINs don’t match. Try again."
+                                        : @"Use 4 to 63 characters (fewer if you use emoji or accents).";
       return;
     }
     NSData* data = [NSJSONSerialization dataWithJSONObject:@{@"op": @"set-pin", @"pin": value} options:0 error:nil];
@@ -631,7 +1005,7 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
     const auto send = deps_.control_request;
     pinBusy_ = YES;
     pinButton_.enabled = NO;
-    pinStatus_.stringValue = @"Approve the PIN change in the swpasskey prompt…";
+    pinStatus_.stringValue = @"Confirm the change in the swpasskey prompt…";
     // The server waits for an AppKit presence prompt: never block the main queue.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
       auto result = send(request);
@@ -645,7 +1019,7 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
         if (tornDown_) return;
         pinBusy_ = NO;
         [self refreshPinState];
-        pinStatus_.stringValue = ok ? @"PIN saved. Retry signing in to your site." : @"PIN was not saved. Retry and approve the prompt.";
+        if (!ok) pinStatus_.stringValue = @"The PIN wasn’t changed.";
       });
     });
   }];
@@ -658,35 +1032,27 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
     swpk::log::debug("menubar_login_item_status",
                      {{"status", std::to_string(static_cast<long>(svc.status))},
                       {"bundle", bundle_path != nullptr ? bundle_path : "?"}});
+    loginCheckbox_.enabled = YES;
     switch (svc.status) {
       case SMAppServiceStatusEnabled:
         loginCheckbox_.state = NSControlStateValueOn;
-        loginCheckbox_.enabled = YES;
-        loginNote_.stringValue = @"Registered as a login item (launchd agent).";
+        loginNote_.stringValue = @"swpasskey opens in the menu bar when you log in.";
         break;
       case SMAppServiceStatusRequiresApproval:
         loginCheckbox_.state = NSControlStateValueOn;
-        loginCheckbox_.enabled = YES;
-        loginNote_.stringValue = @"Waiting for approval in System Settings › General › Login Items.";
+        loginNote_.stringValue = @"Allow swpasskey in System Settings › General › Login Items.";
         break;
       case SMAppServiceStatusNotFound:
-        // launchd has never seen the agent; registering is still allowed and
-        // reports the real error if the bundle really lacks the plist.
-        loginCheckbox_.state = NSControlStateValueOff;
-        loginCheckbox_.enabled = YES;
-        loginNote_.stringValue = @"Starts the daemon in your session at login.";
-        break;
       case SMAppServiceStatusNotRegistered:
       default:
         loginCheckbox_.state = NSControlStateValueOff;
-        loginCheckbox_.enabled = YES;
-        loginNote_.stringValue = @"Starts the daemon in your session at login.";
+        loginNote_.stringValue = @"Websites can use swpasskey only while it’s open.";
         break;
     }
   } else {
     loginCheckbox_.state = NSControlStateValueOff;
     loginCheckbox_.enabled = NO;
-    loginNote_.stringValue = @"Needs macOS 13 or later.";
+    loginNote_.stringValue = @"Requires macOS 13 or later.";
   }
 }
 
@@ -705,29 +1071,31 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
     if (!ok) {
       NSAlert* a = [[NSAlert alloc] init];
       a.alertStyle = NSAlertStyleWarning;
-      a.messageText = @"Could not change the login item";
-      a.informativeText = err != nil ? err.localizedDescription : @"Unknown error";
-      [a beginSheetModalForWindow:prefsWindow_ completionHandler:nil];
+      a.messageText = @"Couldn’t change the login setting";
+      a.informativeText = err != nil ? err.localizedDescription : @"Try again.";
+      [a beginSheetModalForWindow:settingsWindow_ completionHandler:nil];
     }
   }
   [self refreshLoginState];
 }
 
 - (void)changeLogLevel:(id)sender {
-  const std::string name = [levelPopup_.titleOfSelectedItem UTF8String];
-  swpk::log::Level lvl;
-  if (!level_from_name(name, lvl)) return;
-  swpk::log::set_level(lvl);
-  [[NSUserDefaults standardUserDefaults] setObject:ns(name) forKey:@(kLogLevelDefault)];
-  swpk::log::info("menubar_log_level", {{"level", name}});
+  NSString* key = levelPopup_.selectedItem.representedObject;
+  for (const auto& l : kLevels) {
+    if ([key isEqualToString:@(l.key)]) {
+      swpk::log::set_level(l.level);
+      [[NSUserDefaults standardUserDefaults] setObject:key forKey:@(kLogLevelDefault)];
+      swpk::log::info("menubar_log_level", {{"level", l.key}});
+      return;
+    }
+  }
 }
 
 - (void)applyLogLevelPreference {
   NSString* saved = [[NSUserDefaults standardUserDefaults] stringForKey:@(kLogLevelDefault)];
   if (saved == nil) return;
-  swpk::log::Level lvl;
-  if (level_from_name([saved UTF8String], lvl)) {
-    swpk::log::set_level(lvl);
+  for (const auto& l : kLevels) {
+    if ([saved isEqualToString:@(l.key)]) swpk::log::set_level(l.level);
   }
 }
 
