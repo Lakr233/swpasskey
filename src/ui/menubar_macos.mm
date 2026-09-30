@@ -83,15 +83,15 @@ const LevelChoice kLevels[] = {
     {swpk::log::Level::Debug, "debug", @"Detailed (for troubleshooting)"},
 };
 
+// Opening a window from the status menu is an explicit user request, so take
+// the foreground outright. The cooperative -[NSApp activate] (macOS 14+) is
+// often declined here because the previously active app never yielded,
+// which left the Passkeys window behind other apps.
 void activate_app() {
-  if (@available(macOS 14.0, *)) {
-    [NSApp activate];
-  } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    [NSApp activateIgnoringOtherApps:YES];
+  [NSApp activateIgnoringOtherApps:YES];
 #pragma clang diagnostic pop
-  }
 }
 
 NSTextField* label(NSString* text) {
@@ -347,17 +347,33 @@ NSTextField* heading(NSString* text) {
 
 #pragma mark - Dock
 
-- (void)updateDockPolicy {
-  if (tornDown_) return;
+- (BOOL)wantsDockIcon {
   BOOL visible = menuOpen_;
   for (NSWindow* w : {welcomeWindow_, keysWindow_, settingsWindow_}) {
     if (w != nil && (w.visible || w.miniaturized)) visible = YES;
   }
+  return visible;
+}
+
+- (void)updateDockPolicy {
+  if (tornDown_) return;
   const NSApplicationActivationPolicy want =
-      visible ? NSApplicationActivationPolicyRegular : NSApplicationActivationPolicyAccessory;
-  if (NSApp.activationPolicy != want) {
-    [NSApp setActivationPolicy:want];
+      [self wantsDockIcon] ? NSApplicationActivationPolicyRegular : NSApplicationActivationPolicyAccessory;
+  if (NSApp.activationPolicy == want) return;
+  if (want == NSApplicationActivationPolicyAccessory && NSApp.active) {
+    // Dropping to accessory while frontmost pulls our menus out from under
+    // the menu bar and makes it re-lay out (status items jump, worst with a
+    // notch). Hand the menu bar back to the previous app first, then switch
+    // once we are in the background.
+    [NSApp hide:nil];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+      if (!tornDown_ && ![self wantsDockIcon]) {
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+      }
+    });
+    return;
   }
+  [NSApp setActivationPolicy:want];
 }
 
 // Deferred one turn: the window being closed is still visible here, and a
@@ -385,9 +401,17 @@ NSTextField* heading(NSString* text) {
       [window setFrameOrigin:NSMakePoint(NSMidX(area) - size.width / 2, NSMidY(area) - size.height / 2)];
     }
   }
-  [window makeKeyAndOrderFront:nil];
+  [NSApp unhide:nil];
   [self updateDockPolicy];
+  [window makeKeyAndOrderFront:nil];
+  [window orderFrontRegardless];
   activate_app();
+  // The policy switch to regular lands on the next turn; activate again then
+  // so the window really ends up in front of the app that was active.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    activate_app();
+    [window makeKeyAndOrderFront:nil];
+  });
 }
 
 - (void)windowWillClose:(NSNotification*)notification {
