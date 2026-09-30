@@ -369,6 +369,22 @@ NSTextField* heading(NSString* text) {
 }
 
 - (void)present:(NSWindow*)window {
+  // Opened from the menu bar: come to the Space and display the user is on
+  // instead of switching Spaces or opening on a far-away screen. A window
+  // that is already open, or remembered on this screen, stays where it is.
+  window.collectionBehavior |= NSWindowCollectionBehaviorMoveToActiveSpace;
+  if (!window.visible) {
+    NSScreen* screen = [NSScreen mainScreen];
+    const NSPoint mouse = [NSEvent mouseLocation];
+    for (NSScreen* s in [NSScreen screens]) {
+      if (NSPointInRect(mouse, s.frame)) screen = s;
+    }
+    if (screen != nil && !NSIntersectsRect(window.frame, screen.visibleFrame)) {
+      const NSRect area = screen.visibleFrame;
+      const NSSize size = window.frame.size;
+      [window setFrameOrigin:NSMakePoint(NSMidX(area) - size.width / 2, NSMidY(area) - size.height / 2)];
+    }
+  }
   [window makeKeyAndOrderFront:nil];
   [self updateDockPolicy];
   activate_app();

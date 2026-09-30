@@ -102,7 +102,14 @@ PanelText panel_text(swpk::ui::PresenceRequest::Kind kind, NSString* site, NSStr
   panel_.titlebarAppearsTransparent = YES;
   panel_.titleVisibility = NSWindowTitleHidden;
   panel_.movableByWindowBackground = YES;
-  panel_.level = NSModalPanelWindowLevel;
+  // Above every app, including a browser in full screen, on whichever Space
+  // the user is looking at: the request comes from another app and must not
+  // hide behind it.
+  panel_.level = NSStatusWindowLevel;
+  panel_.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                              NSWindowCollectionBehaviorFullScreenAuxiliary |
+                              NSWindowCollectionBehaviorTransient;
+  panel_.hidesOnDeactivate = NO;
   panel_.releasedWhenClosed = NO;
   for (NSWindowButton b : {NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton}) {
     [panel_ standardWindowButton:b].hidden = YES;
@@ -162,8 +169,25 @@ PanelText panel_text(swpk::ui::PresenceRequest::Kind kind, NSString* site, NSStr
     [buttons.widthAnchor constraintEqualToConstant:inner],
   ]];
   [panel_ layoutIfNeeded];
-  [panel_ center];
+  [self centerOnActiveScreen];
   return self;
+}
+
+// With several displays, show the prompt where the user is working: the
+// screen under the pointer, a little above center like a system alert.
+- (void)centerOnActiveScreen {
+  NSScreen* screen = [NSScreen mainScreen];
+  const NSPoint mouse = [NSEvent mouseLocation];
+  for (NSScreen* s in [NSScreen screens]) {
+    if (NSPointInRect(mouse, s.frame)) {
+      screen = s;
+      break;
+    }
+  }
+  const NSRect area = screen != nil ? screen.visibleFrame : NSZeroRect;
+  const NSSize size = panel_.frame.size;
+  [panel_ setFrameOrigin:NSMakePoint(NSMidX(area) - size.width / 2,
+                                     NSMinY(area) + (area.size.height - size.height) * 0.62)];
 }
 
 - (NSModalResponse)runModal {
