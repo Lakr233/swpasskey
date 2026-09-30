@@ -39,7 +39,6 @@ NSString* const kAgentPlist = @"com.tangzixiang.swpasskey.daemon.plist";
 
 NSToolbarItemIdentifier const kSearchItem = @"swpk.search";
 NSToolbarItemIdentifier const kDeleteItem = @"swpk.delete";
-NSToolbarItemIdentifier const kRefreshItem = @"swpk.refresh";
 
 constexpr CGFloat kSettingsWidth = 500;
 
@@ -232,6 +231,8 @@ NSTextField* heading(NSString* text) {
   std::vector<swpk::ui::KeyRow> allRows_;
   std::vector<swpk::ui::KeyRow> rows_;  // allRows_ filtered by the search field
   std::vector<std::string> shownIds_;   // cred ids in the order the table shows them
+  NSTimer* keysTimer_;                  // runs only while the Passkeys window is open
+  unsigned keysTicks_;
   NSStatusItem* item_;
   NSMenu* menu_;
   NSMenuItem* summaryItem_;
@@ -374,6 +375,10 @@ NSTextField* heading(NSString* text) {
 }
 
 - (void)windowWillClose:(NSNotification*)notification {
+  if (notification.object == keysWindow_) {
+    [keysTimer_ invalidate];
+    keysTimer_ = nil;
+  }
   [self scheduleDockUpdate];
 }
 
@@ -503,6 +508,46 @@ NSTextField* heading(NSString* text) {
   }
   [self reloadKeys];
   [self present:keysWindow_];
+  [self startKeysTimer];
+}
+
+// Live list: sites register and sign in while the window is open. Poll the
+// in-process store every 2 s and reload only when a row changed; refresh
+// the relative "Last Used" text every 30 s.
+- (void)startKeysTimer {
+  if (keysTimer_ != nil) return;
+  keysTicks_ = 0;
+  __weak SWPKMenuController* weak = self;
+  keysTimer_ = [NSTimer timerWithTimeInterval:2.0
+                                      repeats:YES
+                                        block:^(NSTimer*) {
+                                          [weak keysTimerFired];
+                                        }];
+  keysTimer_.tolerance = 0.5;
+  [[NSRunLoop mainRunLoop] addTimer:keysTimer_ forMode:NSRunLoopCommonModes];
+}
+
+- (void)keysTimerFired {
+  if (tornDown_ || !keysWindow_.visible) return;
+  if (deps_.store == nullptr) return;
+  auto fresh = swpk::ui::key_rows(*deps_.store);
+  const bool changed =
+      fresh.size() != allRows_.size() ||
+      !std::equal(fresh.begin(), fresh.end(), allRows_.begin(), [](const auto& a, const auto& b) {
+        return a.cred_id_hex == b.cred_id_hex && a.sign_count == b.sign_count &&
+               a.last_used_unix == b.last_used_unix && a.user_name == b.user_name;
+      });
+  if (changed) {
+    allRows_ = std::move(fresh);
+    [self applyFilter];
+    [self refreshSummary];
+  } else if (++keysTicks_ % 15 == 0 && table_.numberOfRows > 0) {
+    const NSInteger col = [table_ columnWithIdentifier:@"used"];
+    if (col >= 0) {
+      [table_ reloadDataForRowIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, rows_.size())]
+                        columnIndexes:[NSIndexSet indexSetWithIndex:static_cast<NSUInteger>(col)]];
+    }
+  }
 }
 
 - (void)focusSearch:(id)sender {
@@ -542,6 +587,7 @@ NSTextField* heading(NSString* text) {
   table_.delegate = self;
   table_.allowsMultipleSelection = NO;
   table_.usesAlternatingRowBackgroundColors = YES;
+  table_.rowHeight = 28;
   table_.columnAutoresizingStyle = NSTableViewUniformColumnAutoresizingStyle;
   table_.target = self;
   struct Col {
@@ -605,7 +651,7 @@ NSTextField* heading(NSString* text) {
 }
 
 - (NSArray<NSToolbarItemIdentifier>*)toolbarDefaultItemIdentifiers:(NSToolbar*)toolbar {
-  return @[ kRefreshItem, NSToolbarFlexibleSpaceItemIdentifier, kDeleteItem, kSearchItem ];
+  return @[ NSToolbarFlexibleSpaceItemIdentifier, kDeleteItem, kSearchItem ];
 }
 
 - (NSArray<NSToolbarItemIdentifier>*)toolbarAllowedItemIdentifiers:(NSToolbar*)toolbar {
@@ -635,11 +681,6 @@ NSTextField* heading(NSString* text) {
     item.autovalidates = NO;
     item.enabled = NO;
     deleteItem_ = item;
-  } else if ([identifier isEqualToString:kRefreshItem]) {
-    item.label = @"Refresh";
-    item.toolTip = @"Reload the passkey list";
-    item.image = [NSImage imageWithSystemSymbolName:@"arrow.clockwise" accessibilityDescription:@"Refresh"];
-    item.action = @selector(reloadKeys);
   }
   return item;
 }
@@ -749,12 +790,23 @@ NSTextField* heading(NSString* text) {
   if (row < 0 || static_cast<std::size_t>(row) >= rows_.size()) return nil;
   const auto& r = rows_[static_cast<std::size_t>(row)];
   NSString* ident = column.identifier;
-  NSTextField* cell = [tableView makeViewWithIdentifier:ident owner:self];
-  if (cell == nil) {
-    cell = label(@"");
-    cell.identifier = ident;
-    cell.lineBreakMode = NSLineBreakByTruncatingTail;
+  NSTableCellView* view = [tableView makeViewWithIdentifier:ident owner:self];
+  if (view == nil) {
+    // A bare text field would sit at the top of the row; center it.
+    view = [[NSTableCellView alloc] init];
+    view.identifier = ident;
+    NSTextField* tf = label(@"");
+    tf.lineBreakMode = NSLineBreakByTruncatingTail;
+    tf.translatesAutoresizingMaskIntoConstraints = NO;
+    [view addSubview:tf];
+    view.textField = tf;
+    [NSLayoutConstraint activateConstraints:@[
+      [tf.leadingAnchor constraintEqualToAnchor:view.leadingAnchor constant:2],
+      [tf.trailingAnchor constraintEqualToAnchor:view.trailingAnchor constant:-2],
+      [tf.centerYAnchor constraintEqualToAnchor:view.centerYAnchor],
+    ]];
   }
+  NSTextField* cell = view.textField;
   cell.textColor = [NSColor labelColor];
   cell.alignment = NSTextAlignmentNatural;
   cell.toolTip = nil;
@@ -778,7 +830,7 @@ NSTextField* heading(NSString* text) {
     cell.stringValue = [NSString stringWithFormat:@"%u", r.sign_count];
     cell.alignment = NSTextAlignmentRight;
   }
-  return cell;
+  return view;
 }
 
 - (void)tableViewSelectionDidChange:(NSNotification*)notification {
@@ -898,6 +950,7 @@ NSTextField* heading(NSString* text) {
                                           action:@selector(toggleWelcome:)];
 
   levelPopup_ = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+  [levelPopup_.widthAnchor constraintEqualToConstant:240].active = YES;
   for (const auto& l : kLevels) {
     [levelPopup_ addItemWithTitle:l.title];
     levelPopup_.lastItem.representedObject = @(l.key);
