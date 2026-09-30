@@ -231,6 +231,7 @@ NSTextField* heading(NSString* text) {
   swpk::ui::MenuBarDeps deps_;
   std::vector<swpk::ui::KeyRow> allRows_;
   std::vector<swpk::ui::KeyRow> rows_;  // allRows_ filtered by the search field
+  std::vector<std::string> shownIds_;   // cred ids in the order the table shows them
   NSStatusItem* item_;
   NSMenu* menu_;
   NSMenuItem* summaryItem_;
@@ -547,25 +548,30 @@ NSTextField* heading(NSString* text) {
     NSString* id;
     NSString* title;
     CGFloat width;
-    NSString* sort;
+    BOOL ascending;  // first click: A→Z for text, newest / most first for dates and counts
   };
   const Col cols[] = {
-      {@"site", @"Website", 190, @"site"}, {@"account", @"Account", 200, @"account"},
-      {@"used", @"Last Used", 110, @"used"}, {@"created", @"Created", 120, @"created"},
-      {@"count", @"Sign-ins", 64, @"count"},
+      {@"site", @"Website", 185, YES},   {@"account", @"Account", 190, YES},
+      {@"used", @"Last Used", 115, NO},  {@"created", @"Created", 115, NO},
+      {@"count", @"Sign-ins", 84, NO},
   };
   for (const auto& c : cols) {
     NSTableColumn* col = [[NSTableColumn alloc] initWithIdentifier:c.id];
     col.title = c.title;
     col.width = c.width;
     col.minWidth = 50;
-    if (c.sort != nil) {
-      col.sortDescriptorPrototype = [NSSortDescriptor sortDescriptorWithKey:c.sort ascending:YES];
-    }
+    col.sortDescriptorPrototype = [NSSortDescriptor sortDescriptorWithKey:c.id ascending:c.ascending];
     if ([c.id isEqualToString:@"count"]) {
       col.headerCell.alignment = NSTextAlignmentRight;
     }
     [table_ addTableColumn:col];
+  }
+  // Column widths and the chosen sort survive relaunches; first run shows
+  // the most recently used passkeys on top.
+  table_.autosaveName = @"SWPKPasskeysTable";
+  table_.autosaveTableColumns = YES;
+  if (table_.sortDescriptors.count == 0) {
+    table_.sortDescriptors = @[ [NSSortDescriptor sortDescriptorWithKey:@"used" ascending:NO] ];
   }
   NSMenu* context = [[NSMenu alloc] init];
   [context addItem:menu_item(@"Copy Website", @selector(copySite:), @"", self)];
@@ -663,7 +669,7 @@ NSTextField* heading(NSString* text) {
     }
   }
   [self sortRows];
-  [table_ reloadData];
+  [self reloadTablePreservingSelection];
   const bool none = allRows_.empty();
   emptyTitle_.stringValue = none ? @"No Passkeys" : @"No Results";
   emptyState_.hidden = !rows_.empty();
@@ -676,35 +682,62 @@ NSTextField* heading(NSString* text) {
   [self updateDeleteItem];
 }
 
+// Sorts rows_ by the header's sort descriptor; ties fall back to website,
+// then account, so the order never jumps between reloads.
 - (void)sortRows {
   NSSortDescriptor* d = table_.sortDescriptors.firstObject;
-  if (d == nil) return;
-  NSString* key = d.key;
-  const bool asc = d.ascending;
+  NSString* key = d != nil ? d.key : @"used";
+  const bool asc = d != nil ? d.ascending : false;
+  auto three_way = [](auto x, auto y) {
+    return x < y ? NSOrderedAscending : x > y ? NSOrderedDescending : NSOrderedSame;
+  };
+  auto by_name = [](const swpk::ui::KeyRow& a, const swpk::ui::KeyRow& b) {
+    NSComparisonResult r = [site_text(a) localizedStandardCompare:site_text(b)];
+    return r != NSOrderedSame ? r : [account_text(a) localizedStandardCompare:account_text(b)];
+  };
   auto cmp = [&](const swpk::ui::KeyRow& a, const swpk::ui::KeyRow& b) -> bool {
     NSComparisonResult r = NSOrderedSame;
     if ([key isEqualToString:@"site"]) {
-      r = [site_text(a) localizedStandardCompare:site_text(b)];
+      r = by_name(a, b);
     } else if ([key isEqualToString:@"account"]) {
       r = [account_text(a) localizedStandardCompare:account_text(b)];
     } else if ([key isEqualToString:@"used"]) {
-      r = a.last_used_unix < b.last_used_unix ? NSOrderedAscending
-          : a.last_used_unix > b.last_used_unix ? NSOrderedDescending : NSOrderedSame;
+      r = three_way(a.last_used_unix, b.last_used_unix);
     } else if ([key isEqualToString:@"created"]) {
-      r = a.created_unix < b.created_unix ? NSOrderedAscending
-          : a.created_unix > b.created_unix ? NSOrderedDescending : NSOrderedSame;
+      r = three_way(a.created_unix, b.created_unix);
     } else if ([key isEqualToString:@"count"]) {
-      r = a.sign_count < b.sign_count ? NSOrderedAscending
-          : a.sign_count > b.sign_count ? NSOrderedDescending : NSOrderedSame;
+      r = three_way(a.sign_count, b.sign_count);
     }
-    return asc ? r == NSOrderedAscending : r == NSOrderedDescending;
+    if (r != NSOrderedSame) {
+      return asc ? r == NSOrderedAscending : r == NSOrderedDescending;
+    }
+    return by_name(a, b) == NSOrderedAscending;  // tie-break always A→Z
   };
   std::stable_sort(rows_.begin(), rows_.end(), cmp);
 }
 
+// Reloads the table and keeps the same passkey selected when it is still
+// listed (sorting and refreshing move rows around).
+- (void)reloadTablePreservingSelection {
+  const NSInteger sel = table_.selectedRow;
+  const std::string keep =
+      sel >= 0 && static_cast<std::size_t>(sel) < shownIds_.size() ? shownIds_[static_cast<std::size_t>(sel)] : "";
+  shownIds_.clear();
+  for (const auto& r : rows_) shownIds_.push_back(r.cred_id_hex);
+  [table_ reloadData];
+  const auto it = std::find(shownIds_.begin(), shownIds_.end(), keep);
+  if (!keep.empty() && it != shownIds_.end()) {
+    const NSInteger row = static_cast<NSInteger>(it - shownIds_.begin());
+    [table_ selectRowIndexes:[NSIndexSet indexSetWithIndex:static_cast<NSUInteger>(row)] byExtendingSelection:NO];
+    [table_ scrollRowToVisible:row];
+  } else {
+    [table_ deselectAll:nil];
+  }
+}
+
 - (void)tableView:(NSTableView*)tableView sortDescriptorsDidChange:(NSArray<NSSortDescriptor*>*)oldDescriptors {
   [self sortRows];
-  [table_ reloadData];
+  [self reloadTablePreservingSelection];
   [self updateDeleteItem];
 }
 
@@ -924,28 +957,33 @@ NSTextField* heading(NSString* text) {
                                 forOrientation:NSLayoutConstraintOrientationHorizontal];
     return f;
   };
-  auto value = [](const std::string& s) {
-    NSTextField* f = label(ns(s));
+  auto value = [](NSString* s) {
+    NSTextField* f = label(s);
     f.selectable = YES;
-    f.toolTip = ns(s);
+    f.toolTip = s;
     [f setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
                                 forOrientation:NSLayoutConstraintOrientationHorizontal];
     return f;
   };
-  NSButton* reveal = [NSButton buttonWithTitle:@"Show in Finder" target:self action:@selector(revealStore:)];
-  reveal.controlSize = NSControlSizeSmall;
-  reveal.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
+  // Folder, not file: shorter, and Finder opens on the thing people look for.
+  NSString* folder = [ns(deps_.store_path).stringByDeletingLastPathComponent stringByAbbreviatingWithTildeInPath];
+  NSButton* reveal = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"arrow.right.circle.fill"
+                                                         accessibilityDescription:@"Show in Finder"]
+                                        target:self
+                                        action:@selector(revealStore:)];
+  reveal.bordered = NO;
+  reveal.contentTintColor = [NSColor secondaryLabelColor];
+  reveal.toolTip = @"Show in Finder";
+  NSStackView* folderRow = [NSStackView stackViewWithViews:@[ value(folder), reveal ]];
+  folderRow.spacing = 4;
   NSGridView* grid = [NSGridView gridViewWithViews:@[
-    @[ key(@"Key storage:"), value(deps_.key_backend) ],
-    @[ key(@"Serial number:"), value(deps_.serial) ],
-    @[ key(@"Passkey file:"), value(deps_.store_path) ],
-    @[ NSGridCell.emptyContentView, reveal ],
-    @[ key(@"Control socket:"), value(deps_.ctl_socket) ],
+    @[ key(@"Key storage:"), value(ns(deps_.key_backend)) ],
+    @[ key(@"Serial number:"), value(ns(deps_.serial)) ],
+    @[ key(@"Data folder:"), folderRow ],
   ]];
   grid.rowSpacing = 6;
   grid.columnSpacing = 8;
   [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
-  [grid rowAtIndex:3].topPadding = -2;
   for (NSInteger i = 0; i < grid.numberOfRows; ++i) {
     [grid rowAtIndex:i].yPlacement = NSGridCellPlacementCenter;
   }
