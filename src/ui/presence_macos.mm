@@ -221,10 +221,15 @@ private:
   bool abort_requested_{false};
   bool finished_{true};  // the main-queue block ran to completion
   Decision decision_{Decision::Deny};
+  // Bumped per confirm(). A main-queue block from an earlier request that
+  // runs late (its confirm() gave up waiting) sees a newer generation and
+  // does nothing, so it can never show old text or decide a newer request.
+  std::uint64_t generation_{0};
 };
 
 Decision AlertPresence::confirm(const PresenceRequest& req, ctap::CancelToken& cancel,
                                 std::chrono::milliseconds timeout) {
+  std::uint64_t gen = 0;
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (busy_) {
@@ -238,6 +243,7 @@ Decision AlertPresence::confirm(const PresenceRequest& req, ctap::CancelToken& c
     abort_requested_ = false;
     finished_ = false;
     decision_ = Decision::Deny;
+    gen = ++generation_;
   }
 
   const PanelText text = panel_text(req.kind, ns_string(detail::clamp_text(req.rp_id)),
@@ -247,6 +253,9 @@ Decision AlertPresence::confirm(const PresenceRequest& req, ctap::CancelToken& c
     bool run_it = false;
     {
       std::lock_guard<std::mutex> lk(mu_);
+      if (gen != generation_) {
+        return;  // stale: a newer confirm() owns the state now
+      }
       run_it = !decided_ && !abort_requested_;
       modal_running_ = run_it;
     }
@@ -300,7 +309,7 @@ Decision AlertPresence::confirm(const PresenceRequest& req, ctap::CancelToken& c
       bool running = false;
       {
         std::lock_guard<std::mutex> lk(mu_);
-        running = modal_running_;
+        running = modal_running_ && gen == generation_;
       }
       // Both blocks run on the main queue, so this cannot interleave with the
       // alert block's own code: either the modal loop is spinning (and is

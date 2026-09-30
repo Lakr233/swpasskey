@@ -119,15 +119,25 @@ NSDate* date_of(std::uint64_t unix_seconds) {
   return [NSDate dateWithTimeIntervalSince1970:static_cast<double>(unix_seconds)];
 }
 
+// The UI is English-only, so dates are too: a system locale would mix
+// "3 天前" into English columns.
+NSLocale* ui_locale() {
+  static NSLocale* l = [NSLocale localeWithLocaleIdentifier:@"en_US"];
+  return l;
+}
+
+NSDateFormatter* date_formatter(NSDateFormatterStyle date, NSDateFormatterStyle time) {
+  NSDateFormatter* d = [[NSDateFormatter alloc] init];
+  d.locale = ui_locale();
+  d.dateStyle = date;
+  d.timeStyle = time;
+  return d;
+}
+
 // "Created": the day only; the time adds noise to a list.
 NSString* format_day(std::uint64_t unix_seconds) {
   if (unix_seconds == 0) return @"—";
-  static NSDateFormatter* f = [] {
-    NSDateFormatter* d = [[NSDateFormatter alloc] init];
-    d.dateStyle = NSDateFormatterMediumStyle;
-    d.timeStyle = NSDateFormatterNoStyle;
-    return d;
-  }();
+  static NSDateFormatter* f = date_formatter(NSDateFormatterMediumStyle, NSDateFormatterNoStyle);
   return [f stringFromDate:date_of(unix_seconds)];
 }
 
@@ -136,17 +146,18 @@ NSString* format_recent(std::uint64_t unix_seconds) {
   if (unix_seconds == 0) return @"Never";
   static NSRelativeDateTimeFormatter* f = [] {
     NSRelativeDateTimeFormatter* r = [[NSRelativeDateTimeFormatter alloc] init];
+    r.locale = ui_locale();
     r.unitsStyle = NSRelativeDateTimeFormatterUnitsStyleFull;
     return r;
   }();
   return [f localizedStringForDate:date_of(unix_seconds) relativeToDate:[NSDate date]];
 }
 
+// Tooltip: the exact moment.
 NSString* format_full(std::uint64_t unix_seconds) {
   if (unix_seconds == 0) return nil;
-  return [NSDateFormatter localizedStringFromDate:date_of(unix_seconds)
-                                        dateStyle:NSDateFormatterLongStyle
-                                        timeStyle:NSDateFormatterShortStyle];
+  static NSDateFormatter* f = date_formatter(NSDateFormatterLongStyle, NSDateFormatterShortStyle);
+  return [f stringFromDate:date_of(unix_seconds)];
 }
 
 // The domain is what the passkey is bound to; the RP's display name is only a
