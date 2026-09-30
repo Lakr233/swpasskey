@@ -154,7 +154,7 @@ NSString* format_full(std::uint64_t unix_seconds) {
 NSString* site_text(const swpk::ui::KeyRow& r) { return ns(r.rp_id); }
 
 NSString* account_text(const swpk::ui::KeyRow& r) {
-  if (r.u2f) return @"Security key sign-in (U2F)";
+  if (r.u2f) return @"Security key sign-in";
   return ns(r.user_name.empty() ? r.user_display : r.user_name);
 }
 
@@ -796,12 +796,13 @@ NSTextField* heading(NSString* text) {
   if (!r) {
     NSAlert* err = [[NSAlert alloc] init];
     err.alertStyle = NSAlertStyleCritical;
-    err.messageText = @"Couldn’t delete the passkey";
-    err.informativeText = [NSString stringWithFormat:
-        @"Try again. If it keeps failing, check the log in ~/Library/Logs/swpasskey. (Error 0x%02x)",
-        static_cast<unsigned>(r.error())];
+    err.messageText = @"Unable to Delete Passkey";
+    err.informativeText =
+        @"Try again. If it keeps failing, check the log in ~/Library/Logs/swpasskey.";
     [err beginSheetModalForWindow:keysWindow_ completionHandler:nil];
-    swpk::log::warn("menubar_delete_failed", {{"cred_id", row.cred_id_hex.substr(0, 16)}});
+    swpk::log::warn("menubar_delete_failed",
+                    {{"cred_id", row.cred_id_hex.substr(0, 16)},
+                     {"error", std::to_string(static_cast<unsigned>(r.error()))}});
   } else {
     swpk::log::warn("menubar_delete", {{"cred_id", row.cred_id_hex.substr(0, 16)}, {"rp", row.rp_id}});
   }
@@ -965,7 +966,7 @@ NSTextField* heading(NSString* text) {
   if (pinBusy_ || !deps_.control_request) return;
   const bool configured = deps_.store != nullptr && deps_.store->pin().hash.has_value();
   NSAlert* alert = [[NSAlert alloc] init];
-  alert.messageText = configured ? @"Change the security key PIN" : @"Set a security key PIN";
+  alert.messageText = configured ? @"Change Security Key PIN" : @"Set Security Key PIN";
   alert.informativeText = @"Use at least 4 characters. Websites that ask for a PIN will use this one.";
   NSButton* save = [alert addButtonWithTitle:configured ? @"Change PIN" : @"Set PIN"];
   [alert addButtonWithTitle:@"Cancel"];
@@ -1071,7 +1072,7 @@ NSTextField* heading(NSString* text) {
     if (!ok) {
       NSAlert* a = [[NSAlert alloc] init];
       a.alertStyle = NSAlertStyleWarning;
-      a.messageText = @"Couldn’t change the login setting";
+      a.messageText = @"Unable to Change Login Setting";
       a.informativeText = err != nil ? err.localizedDescription : @"Try again.";
       [a beginSheetModalForWindow:settingsWindow_ completionHandler:nil];
     }
