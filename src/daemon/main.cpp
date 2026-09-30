@@ -272,6 +272,9 @@ int main(int argc, char** argv) {
     swpk::ui::MenuBarDeps mdeps;
     mdeps.store = store.get();
     mdeps.delete_key = [&auth](std::span<const std::uint8_t> id) { return auth.ctl_delete(id); };
+    mdeps.control_request = [path = ctl.path()](const std::string& line) {
+      return swpk::ctl::request(path, line);
+    };
     mdeps.quit = [&loop] { loop.stop(); };
     mdeps.version = SWPASSKEY_VERSION;
     mdeps.key_backend = swpk::ui::backend_label(primary->kind());

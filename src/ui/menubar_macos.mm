@@ -112,6 +112,10 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   NSButton* loginCheckbox_;
   NSTextField* loginNote_;
   NSPopUpButton* levelPopup_;
+  NSButton* pinButton_;
+  NSTextField* pinStatus_;
+  BOOL pinBusy_;
+  BOOL tornDown_;
 }
 
 - (instancetype)initWithDeps:(swpk::ui::MenuBarDeps)deps {
@@ -158,6 +162,7 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
 }
 
 - (void)teardown {
+  tornDown_ = YES;
   if (item_ != nil) {
     [[NSStatusBar systemStatusBar] removeStatusItem:item_];
     item_ = nil;
@@ -334,12 +339,13 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
     [self buildPreferencesWindow];
   }
   [self refreshLoginState];
+  [self refreshPinState];
   activate_app();
   [prefsWindow_ makeKeyAndOrderFront:nil];
 }
 
 - (void)buildPreferencesWindow {
-  const CGFloat W = 480, H = 330;
+  const CGFloat W = 480, H = 420;
   prefsWindow_ = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, W, H)
                                              styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
                                                backing:NSBackingStoreBuffered
@@ -374,6 +380,20 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
   [v addSubview:levelNote];
   y -= 34;
 
+  [v addSubview:label(@"Security key PIN", NSMakeRect(20, y, 240, 20), true)];
+  pinButton_ = [NSButton buttonWithTitle:@"Set PIN…" target:self action:@selector(setPin:)];
+  pinButton_.frame = NSMakeRect(W - 150, y - 5, 130, 30);
+  [v addSubview:pinButton_];
+  y -= 26;
+  pinStatus_ = label(@"", NSMakeRect(20, y, W - 40, 20));
+  [v addSubview:pinStatus_];
+  y -= 24;
+  NSTextField* pinNote = label(@"Used by sites that require PIN verification to sign in.",
+                              NSMakeRect(20, y, W - 40, 20));
+  pinNote.textColor = [NSColor secondaryLabelColor];
+  [v addSubview:pinNote];
+  y -= 40;
+
   NSBox* sep = [[NSBox alloc] initWithFrame:NSMakeRect(20, y, W - 40, 1)];
   sep.boxType = NSBoxSeparator;
   [v addSubview:sep];
@@ -394,6 +414,72 @@ NSTextField* label(NSString* text, NSRect frame, bool bold = false) {
     [v addSubview:label(ns(f.v), NSMakeRect(140, y, W - 160, 18))];
     y -= 24;
   }
+}
+
+- (void)refreshPinState {
+  if (pinBusy_) return;
+  const bool configured = deps_.store != nullptr && deps_.store->pin().hash.has_value();
+  pinStatus_.stringValue = configured ? @"PIN is configured." : @"No PIN set. Set one before signing in with a passkey.";
+  pinButton_.title = configured ? @"Set new PIN…" : @"Set PIN…";
+  pinButton_.enabled = static_cast<bool>(deps_.control_request);
+}
+
+- (void)setPin:(id)sender {
+  if (pinBusy_ || !deps_.control_request) return;
+  NSAlert* alert = [[NSAlert alloc] init];
+  alert.messageText = @"Set your security key PIN";
+  alert.informativeText = @"Choose at least 4 characters (up to 63 UTF-8 bytes). You’ll use this PIN when signing in. Existing passkeys are kept.";
+  [alert addButtonWithTitle:@"Set PIN"];
+  [alert addButtonWithTitle:@"Cancel"];
+  NSView* form = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 340, 110)];
+  [form addSubview:label(@"New PIN", NSMakeRect(0, 86, 340, 20))];
+  NSSecureTextField* pin = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 60, 340, 24)];
+  pin.accessibilityLabel = @"New PIN";
+  [form addSubview:pin];
+  [form addSubview:label(@"Repeat PIN", NSMakeRect(0, 30, 340, 20))];
+  NSSecureTextField* repeat = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 4, 340, 24)];
+  repeat.accessibilityLabel = @"Repeat PIN";
+  [form addSubview:repeat];
+  pin.nextKeyView = repeat;
+  alert.accessoryView = form;
+  alert.window.initialFirstResponder = pin;
+  [alert beginSheetModalForWindow:prefsWindow_ completionHandler:^(NSModalResponse response) {
+    NSString* value = pin.stringValue;
+    const BOOL matches = [value isEqualToString:repeat.stringValue];
+    pin.stringValue = @"";
+    repeat.stringValue = @"";
+    if (response != NSAlertFirstButtonReturn || tornDown_) return;
+    const NSUInteger bytes = [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    const NSUInteger characters = [value lengthOfBytesUsingEncoding:NSUTF32LittleEndianStringEncoding] / 4;
+    if (!matches || characters < 4 || bytes > 63 ||
+        [value rangeOfString:[NSString stringWithFormat:@"%C", (unichar)0]].location != NSNotFound) {
+      pinStatus_.stringValue = !matches ? @"PINs did not match. Try again." : @"Use at least 4 characters and at most 63 UTF-8 bytes.";
+      return;
+    }
+    NSData* data = [NSJSONSerialization dataWithJSONObject:@{@"op": @"set-pin", @"pin": value} options:0 error:nil];
+    if (data == nil) return;
+    const std::string request(static_cast<const char*>(data.bytes), data.length);
+    const auto send = deps_.control_request;
+    pinBusy_ = YES;
+    pinButton_.enabled = NO;
+    pinStatus_.stringValue = @"Approve the PIN change in the swpasskey prompt…";
+    // The server waits for an AppKit presence prompt: never block the main queue.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      auto result = send(request);
+      BOOL ok = NO;
+      if (result) {
+        NSData* reply = [NSData dataWithBytes:result->data() length:result->size()];
+        id json = [NSJSONSerialization JSONObjectWithData:reply options:0 error:nil];
+        ok = [json isKindOfClass:[NSDictionary class]] && [json[@"ok"] isEqual:@YES];
+      }
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (tornDown_) return;
+        pinBusy_ = NO;
+        [self refreshPinState];
+        pinStatus_.stringValue = ok ? @"PIN saved. Retry signing in to your site." : @"PIN was not saved. Retry and approve the prompt.";
+      });
+    });
+  }];
 }
 
 - (void)refreshLoginState {
