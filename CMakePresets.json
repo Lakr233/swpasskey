@@ -30,6 +30,7 @@
       "inherits": "release",
       "binaryDir": "${sourceDir}/build/app",
       "cacheVariables": {
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "14.0",
         "SWPASSKEY_TPM": "OFF",
         "SWPASSKEY_STATIC_OPENSSL": "ON"
       }
