@@ -148,6 +148,12 @@ version, key storage, serial, store path and control socket. The app icon is
 rendered by `packaging/macos/make_icon.swift`; `make_app.sh` copies
 `Resources/` and `Library/` from the bundle template.
 
+For passkey sign-in on sites that require user verification, open
+**Preferences → Set PIN…**, enter and repeat your PIN, then approve the
+swpasskey prompt. The PIN is used by the browser during sign-in; existing
+credentials are preserved. Preferences shows whether a PIN is configured
+and lets you set a new one with local approval.
+
 ## Threat model (short)
 
 | Attacker | Residual |

@@ -22,6 +22,8 @@ struct MenuBarDeps {
   // Deletes one credential (Authenticator::ctl_delete). Called on the main
   // thread after the user confirmed.
   std::function<Result<void>(std::span<const std::uint8_t> cred_id)> delete_key;
+  // Socket client; safe to call off the main thread without retaining auth.
+  std::function<Result<std::string>(const std::string&)> control_request;
   // Stops the daemon (loop.stop()).
   std::function<void()> quit;
   std::string version;
